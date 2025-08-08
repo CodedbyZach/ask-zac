@@ -1,7 +1,13 @@
+import sys, os
+sys.stderr = open(os.devnull, 'w')
+os.environ["JACK_NO_MSG"] = "1"
+os.environ["SDL_JACK_NO_MSG"] = "1"
+os.environ["ALSA_LOGLEVEL"] = "none"
+os.environ["ALSA_DEBUG"] = "0"
+
 import openai
 import speech_recognition as sr
 from dotenv import load_dotenv
-import os
 import requests
 import threading
 import tkinter as tk
