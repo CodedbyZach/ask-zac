@@ -96,8 +96,8 @@ class AskZacApp:
         self.entry.pack(padx=8, pady=3)
         self.entry.bind('<Return>', self.on_enter)
 
-        self.append("AskZac: Hi, I am AskZac. Say 'Hey, GPT' or type your question. (Say/type 'q' to quit)")
-        speak_openai("Hi, I am AskZac. Say Hey, GPT to begin.", self.start_wakeword_loop)
+        self.append("AskZac: Hi, I am AskZac. Say 'GPT' or type your question. (Say/type 'q' to quit)")
+        speak_openai("Hi, I am AskZac. Say GPT to begin.", self.start_wakeword_loop)
 
     def append(self, msg):
         self.text_area.insert(tk.END, msg + "\n")
@@ -117,7 +117,7 @@ class AskZacApp:
 
     def wakeword_loop(self):
         while True:
-            self.append("Listening for: 'Hey, GPT' ...")
+            self.append("Listening for: 'GPT' ...")
             try:
                 with mic as source:
                     recognizer.adjust_for_ambient_noise(source)
@@ -127,18 +127,19 @@ class AskZacApp:
                     wake_text = recognizer.recognize_google(audio)
                     self.append(f"You said: {wake_text}")
                 except:
-                    self.append("Sorry, I didn't catch that. Say 'Hey, GPT' to start.")
+                    self.append("Sorry, I didn't catch that. Say 'GPT' to start.")
                     continue
                 if wake_text.strip().lower() == "q":
                     self.append("Goodbye!")
                     self.root.destroy()
                     sys.exit(0)
-                if "hey gpt" in wake_text.strip().lower():
+                # Only "gpt" is accepted now (not "hey gpt")
+                if "gpt" == wake_text.strip().lower():
                     self.append("Heard wake word! Listening for your question...")
                     self.listen_for_question()
                     break  # Exit loop until speech completes
                 else:
-                    self.append("Didn't hear 'Hey, GPT'. Waiting...")
+                    self.append("Didn't hear 'GPT'. Waiting...")
             except Exception as e:
                 self.append(f"Wakeword speech error: {e}")
                 continue
@@ -154,7 +155,7 @@ class AskZacApp:
                 query = recognizer.recognize_google(audio)
                 self.append(f"You said: {query}")
             except:
-                self.append("Sorry, I didn't catch that. Say 'Hey, GPT' again to start.")
+                self.append("Sorry, I didn't catch that. Say 'GPT' again to start.")
                 self.start_wakeword_loop()
                 return
             if query.strip().lower() == "q":
