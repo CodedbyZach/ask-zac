@@ -12,7 +12,6 @@ import requests
 import threading
 import tkinter as tk
 from tkinter.scrolledtext import ScrolledText
-import sys
 import subprocess
 
 # Load environment variables
@@ -182,5 +181,13 @@ class AskZacApp:
 
 if __name__ == "__main__":
     root = tk.Tk()
+
+    # -------- Position GUI on second screen --------
+    # CHANGE 1920 TO YOUR MAIN SCREEN WIDTH IF DIFFERENT
+    second_screen_x = 1920  # If your primary monitor is not 1920 wide, set to your actual width
+    second_screen_y = 0
+    root.geometry(f"+{second_screen_x}+{second_screen_y}")
+    # -------- End positioning --------
+
     app = AskZacApp(root)
     root.mainloop()
