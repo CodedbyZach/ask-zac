@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 
 # Alexa-style full-screen UI on monitor #2, blue wake bar at bottom that appears
-# ONLY when the user says "GPT". Functionality unchanged.
+# ONLY when the user says "GPT". Now: weather + search results are ALWAYS
+# phrased via ChatGPT (no raw snippets).
 
 import sys, os, re, difflib, time, threading, subprocess, json, math
 sys.stderr = open(os.devnull, 'w')
@@ -137,8 +138,7 @@ def geocode_zip(zip_code):
     r.raise_for_status()
     j = r.json()
     place = j["places"][0]
-    lat = float(place["latitude"])
-    lon = float(place["longitude"])
+    lat = float(place["latitude"]); lon = float(place["longitude"])
     place_name = f'{place["place name"]}, {place["state abbreviation"]}'
     return lat, lon, place_name
 
@@ -196,14 +196,16 @@ def ask_openai(prompt):
         return UNCERTAIN_TOKEN
 
 def ask_openai_style_weather(summary_dict):
+    """Always phrase weather nicely (no raw numbers)."""
     try:
         msg = json.dumps(summary_dict)
         resp = openai.chat.completions.create(
             model="gpt-4o",
-            temperature=0.3,
+            temperature=0.2,
             messages=[
                 {"role":"system","content":
-                 "Rewrite as one short voice sentence (°F/mph/inches), include city, hi/lo, notable precip, brief wind."},
+                 "Turn the given weather data into ONE short, natural sentence for a voice assistant. "
+                 "Use °F, mph, inches. Include the city, today's high/low, notable precip %, and brief wind."},
                 {"role":"user","content":msg}
             ],
             max_tokens=120
@@ -218,6 +220,7 @@ def ask_openai_style_weather(summary_dict):
             return "Here's the local forecast."
 
 def ask_openai_from_search(query, results):
+    """Synthesize an answer from snippets (no raw snippets to user)."""
     try:
         payload = {"query": query, "results": results}
         resp = openai.chat.completions.create(
@@ -225,17 +228,37 @@ def ask_openai_from_search(query, results):
             temperature=0.2,
             messages=[
                 {"role":"system","content":
-                 "Answer ONLY using the snippets in 1–3 sentences, else '<i-dont-know>'."},
+                 "You are a concise assistant. Using ONLY the provided search snippets, "
+                 "answer the user's question in a natural 1–2 sentence reply."},
                 {"role":"user","content": json.dumps(payload)}
             ],
             max_tokens=180
         )
         text = (resp.choices[0].message.content or "").strip()
-        if text.lower() in {UNCERTAIN_TOKEN, "<i dont know>", "<i_dont_know>", "<idontknow>"}:
-            return UNCERTAIN_TOKEN
-        return text
+        if text and text.lower() not in {UNCERTAIN_TOKEN, "<i dont know>", "<i_dont_know>", "<idontknow>"}:
+            return text
+        return UNCERTAIN_TOKEN
     except Exception:
         return UNCERTAIN_TOKEN
+
+def refine_text_with_openai(query, context_text):
+    """Last-resort phrasing pass so we NEVER speak raw data."""
+    try:
+        resp = openai.chat.completions.create(
+            model="gpt-4o",
+            temperature=0.3,
+            messages=[
+                {"role":"system","content":
+                 "Rephrase the given terse data into a single, friendly sentence suitable for a voice assistant. "
+                 "Be precise and concise."},
+                {"role":"user","content": json.dumps({"query": query, "data": context_text})}
+            ],
+            max_tokens=120
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        return text if text else context_text
+    except Exception:
+        return context_text
 
 def speak_openai(text, on_done, voice="alloy"):
     def tts_thread():
@@ -435,7 +458,6 @@ class AskZacWindow(QMainWindow):
         root.setContentsMargins(40, 30, 40, 24)
         root.setSpacing(12)
 
-        # Top row: Title (left), Clock (right)
         top = QHBoxLayout()
         self.title = QLabel("AskZac", self); self.title.setObjectName("title")
         self.title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -445,16 +467,13 @@ class AskZacWindow(QMainWindow):
         top.addWidget(self.clock, 0, Qt.AlignRight)
         root.addLayout(top)
 
-        # Status row
         self.statusLabel = QLabel("Idle", self); self.statusLabel.setObjectName("status")
         root.addWidget(self.statusLabel, 0, Qt.AlignLeft)
 
-        # Conversation card
         self.textArea = QTextEdit(self); self.textArea.setReadOnly(True)
         self.textArea.setLineWrapMode(QTextEdit.WidgetWidth)
         root.addWidget(self.textArea, 1)
 
-        # Input row + mic toggle
         inputRow = QHBoxLayout()
         self.entry = QLineEdit(self)
         self.entry.setPlaceholderText("Say “GPT, …” or type here. Type q to quit.")
@@ -466,14 +485,12 @@ class AskZacWindow(QMainWindow):
         inputRow.addWidget(self.micBtn, 0, Qt.AlignRight)
         root.addLayout(inputRow)
 
-        # Wake bar pinned to bottom
         self.wakeBar = WakeBar(self, height=14)
         root.addWidget(self.wakeBar)
 
         self.setCentralWidget(central)
         self.appendSignal.connect(self._append)
 
-        # Mic listener
         self.listener = MicListener(self)
         self.listener.append.connect(self.append)
         self.listener.query.connect(self.ask_and_speak)
@@ -494,7 +511,6 @@ class AskZacWindow(QMainWindow):
         if len(screens) > index:
             geo = screens[index].geometry()
             if fullscreen:
-                # occupy that screen fully (Echo Show vibe)
                 self.setGeometry(geo)
                 self.showFullScreen()
             else:
@@ -503,7 +519,6 @@ class AskZacWindow(QMainWindow):
                 y = geo.y() + (geo.height()-self.height())//3
                 self.move(x, y)
         else:
-            # fallback: just show normally on current screen
             if fullscreen:
                 self.showFullScreen()
 
@@ -516,7 +531,6 @@ class AskZacWindow(QMainWindow):
         self.textArea.moveCursor(self.textArea.textCursor().End)
 
     def set_status(self, status: str):
-        # Alexa-like short statuses
         self.statusLabel.setText(status)
 
     def toggle_listening(self):
@@ -539,7 +553,6 @@ class AskZacWindow(QMainWindow):
 
     # ----- Wake bar control -----
     def onWake(self):
-        # Show/pulse ONLY when "GPT" is spoken
         self.wakeBar.showActive(True)
         QTimer.singleShot(WAKE_BAR_MS, lambda: self.wakeBar.showActive(False))
 
@@ -551,7 +564,7 @@ class AskZacWindow(QMainWindow):
         if txt:
             self.ask_and_speak(txt)
 
-    # ----- Core logic (unchanged behavior) -----
+    # ----- Core logic (ALWAYS phrased via GPT) -----
     def ask_and_speak(self, query: str):
         self.append(f"You: {query}")
         self.append("Thinking...")
@@ -560,7 +573,7 @@ class AskZacWindow(QMainWindow):
         def worker():
             answer = ask_openai(query)
 
-            # Weather-smart path
+            # Weather-smart path (always phrased)
             if answer == UNCERTAIN_TOKEN and looks_like_weather(query):
                 try:
                     w = fetch_weather_zip(USER_ZIP, tz=TZ)
@@ -575,24 +588,29 @@ class AskZacWindow(QMainWindow):
                         "sunset": w["sunset"][0],
                     }
                     summary = {"zip": USER_ZIP, "place": w["place"], "today": today}
-                    styled = ask_openai_style_weather(summary)
-                    self.append(f"AskZac: {styled}")
+                    phrased = ask_openai_style_weather(summary)
+                    self.append(f"AskZac: {phrased}")
                     self.pause_listening()
                     self.set_status("Speaking")
-                    speak_openai(styled, on_done=lambda: self._resume_after_tts())
+                    speak_openai(phrased, on_done=lambda: self._resume_after_tts())
                     return
                 except Exception as e:
-                    self.append(f"Weather fetch failed: {e}. Using web search…")
+                    self.append(f"Weather fetch failed: {e}. Checking the web…")
 
-            # Generic search synth
+            # Web search synth (never raw)
             if answer == UNCERTAIN_TOKEN:
-                self.append(f"AskZac: {UNCERTAIN_TOKEN}")
+                self.append("Checking the web…")
                 results = web_search_structured(query, n=SEARCH_RESULTS_N)
                 synth = ask_openai_from_search(query, results)
                 if synth == UNCERTAIN_TOKEN:
-                    fallback = results[0]["title"] + ": " + results[0]["snippet"]
-                    self.append(f"AskZac (web): {fallback}")
-                    to_say = fallback
+                    # Build minimal context and have GPT rephrase it
+                    if results:
+                        blob = f"{results[0].get('title','')}: {results[0].get('snippet','')}"
+                    else:
+                        blob = "No reliable snippets were available."
+                    phrased = refine_text_with_openai(query, blob)
+                    self.append(f"AskZac (web): {phrased}")
+                    to_say = phrased
                 else:
                     self.append(f"AskZac (web): {synth}")
                     to_say = synth
@@ -601,7 +619,7 @@ class AskZacWindow(QMainWindow):
                 speak_openai(to_say, on_done=lambda: self._resume_after_tts())
                 return
 
-            # Normal path
+            # Normal path (already phrased answer)
             self.append(f"AskZac: {answer}")
             self.pause_listening()
             self.set_status("Speaking")
@@ -613,7 +631,6 @@ class AskZacWindow(QMainWindow):
         self.resume_listening()
         self.set_status("Listening")
 
-    # Exit full-screen with Esc (handy when FULLSCREEN_ON_SECOND=True)
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape and self.isFullScreen():
             self.showNormal()
@@ -630,7 +647,6 @@ class AskZacWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     win = AskZacWindow()
-    # Show then move/maximize to second monitor like an Alexa screen
-    win.show()  # must be shown before moving to another screen
+    win.show()
     win.place_on_second_monitor(index=SECOND_MONITOR_INDEX, fullscreen=FULLSCREEN_ON_SECOND)
     sys.exit(app.exec_())
