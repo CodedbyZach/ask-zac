@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# ====== System & Env Suppression (same as before) ======
+# Alexa-style full-screen UI on monitor #2, blue wake bar at bottom that appears
+# ONLY when the user says "GPT". Functionality unchanged.
+
 import sys, os, re, difflib, time, threading, subprocess, json, math
 sys.stderr = open(os.devnull, 'w')
 os.environ["JACK_NO_MSG"] = "1"
@@ -9,21 +11,19 @@ os.environ["SDL_JACK_NO_MSG"] = "1"
 os.environ["ALSA_LOGLEVEL"] = "none"
 os.environ["ALSA_DEBUG"] = "0"
 
-# ====== Core Libraries (same as before) ======
 import openai
 import speech_recognition as sr
 from dotenv import load_dotenv
 import requests
 
-# ====== PyQt5 UI ======
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize
-from PyQt5.QtGui import QPainter, QRadialGradient, QColor, QFont
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QTime, QDate
+from PyQt5.QtGui import QPainter, QLinearGradient, QColor, QFont
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel,
     QTextEdit, QLineEdit, QHBoxLayout, QPushButton, QSizePolicy
 )
 
-# =============== Config ===============
+# ================== Config ==================
 WAKE_CANONICAL = "gpt"
 WAKE_CANONICAL_SPOKEN = "gee pee tee"
 WAKE_TIMEOUT_S   = 6.0
@@ -34,14 +34,18 @@ UNCERTAIN_TOKEN  = "<i-dont-know>"
 USER_ZIP         = "14580"  # Webster, NY
 TZ               = "America/New_York"
 SEARCH_RESULTS_N = 3
-# =====================================
+SECOND_MONITOR_INDEX = 1      # 0=primary, 1=second
+FULLSCREEN_ON_SECOND = True   # Alexa-style: full-screen
+WAKE_BAR_MS = 1600            # how long the wake bar pulses after "GPT"
+# ===========================================
 
-# Load environment
+# ====== Env / API ======
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 openai.api_key = OPENAI_API_KEY
 
+# ====== Speech Recog ======
 recognizer = sr.Recognizer()
 recognizer.pause_threshold = 0.25
 recognizer.non_speaking_duration = 0.2
@@ -111,9 +115,6 @@ def split_after_wake(raw: str) -> str:
 
 # ---------- Data fetchers ----------
 def web_search_structured(query, n=SEARCH_RESULTS_N):
-    """
-    Return top N SerpAPI organic results as a list of {title, snippet, link, position}.
-    """
     try:
         url = "https://serpapi.com/search.json"
         params = {"q": query, "api_key": SERPAPI_KEY, "engine": "google"}
@@ -132,7 +133,6 @@ def web_search_structured(query, n=SEARCH_RESULTS_N):
         return [{"position": 0, "title": "Search failed", "snippet": str(e), "link": ""}]
 
 def geocode_zip(zip_code):
-    # Zippopotam.us is free/no key
     r = requests.get(f"http://api.zippopotam.us/us/{zip_code}", timeout=10)
     r.raise_for_status()
     j = r.json()
@@ -143,9 +143,6 @@ def geocode_zip(zip_code):
     return lat, lon, place_name
 
 def fetch_weather_zip(zip_code, tz=TZ):
-    """
-    Open-Meteo with imperial units directly (°F, mph, inches).
-    """
     lat, lon, place = geocode_zip(zip_code)
     params = {
         "latitude": lat, "longitude": lon,
@@ -162,7 +159,7 @@ def fetch_weather_zip(zip_code, tz=TZ):
     r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=15)
     r.raise_for_status()
     d = r.json().get("daily", {})
-    out = {
+    return {
         "place": place,
         "dates": d.get("time", []),
         "tmax": d.get("temperature_2m_max", []),
@@ -174,22 +171,20 @@ def fetch_weather_zip(zip_code, tz=TZ):
         "sunset": d.get("sunset", []),
         "lat": lat, "lon": lon
     }
-    return out
 # -----------------------------------
 
+# ---------- OpenAI helpers ----------
 def ask_openai(prompt):
-    """
-    Returns model text or the exact token <i-dont-know> if uncertain.
-    """
     try:
         resp = openai.chat.completions.create(
             model="gpt-4o",
             temperature=0,
             messages=[
-                {"role": "system", "content":
-                 f"You are a careful assistant. If you are not confident you know the answer, "
-                 f"or the answer depends on up-to-date web info you don't have, reply EXACTLY with {UNCERTAIN_TOKEN} and nothing else."},
-                {"role": "user", "content": prompt}
+                {
+                    "role":"system",
+                    "content": f"You are a careful assistant. If unsure or lacking fresh web info, reply EXACTLY with {UNCERTAIN_TOKEN}."
+                },
+                {"role":"user","content":prompt}
             ],
             max_tokens=300,
         )
@@ -201,47 +196,37 @@ def ask_openai(prompt):
         return UNCERTAIN_TOKEN
 
 def ask_openai_style_weather(summary_dict):
-    """
-    Turn structured imperial weather into a natural sentence.
-    """
     try:
         msg = json.dumps(summary_dict)
         resp = openai.chat.completions.create(
             model="gpt-4o",
             temperature=0.3,
             messages=[
-                {"role": "system", "content":
-                 "Rewrite the given weather data into a single friendly sentence for a voice assistant. "
-                 "Use °F, mph, and inches. Say the city correctly from the data, keep it concise, "
-                 "include today's high/low, mention precip chances if notable, and a brief wind note. No emojis."},
-                {"role": "user", "content": msg}
+                {"role":"system","content":
+                 "Rewrite as one short voice sentence (°F/mph/inches), include city, hi/lo, notable precip, brief wind."},
+                {"role":"user","content":msg}
             ],
             max_tokens=120
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception:
         try:
-            p = summary_dict
-            t = p['today']
+            p = summary_dict; t = p['today']
             return (f"{p['place']} today: high {round(t['tmax'])}°F, low {round(t['tmin'])}°F, "
-                    f"{t['popmax']}% precip chance ({t['precip']:.2f} in), winds up to {round(t['windmax'])} mph.")
+                    f"{t['popmax']}% precip ({t['precip']:.2f} in), winds up to {round(t['windmax'])} mph.")
         except Exception:
             return "Here's the local forecast."
 
 def ask_openai_from_search(query, results):
-    """
-    Feed top search results to GPT to synthesize a concise, human answer.
-    """
     try:
         payload = {"query": query, "results": results}
         resp = openai.chat.completions.create(
             model="gpt-4o",
             temperature=0.2,
             messages=[
-                {"role": "system", "content":
-                 "You are a concise assistant. Based ONLY on the provided search snippets, "
-                 "answer the user's question in 1–3 sentences. If the snippets are insufficient, say '<i-dont-know>'."},
-                {"role": "user", "content": json.dumps(payload)}
+                {"role":"system","content":
+                 "Answer ONLY using the snippets in 1–3 sentences, else '<i-dont-know>'."},
+                {"role":"user","content": json.dumps(payload)}
             ],
             max_tokens=180
         )
@@ -259,10 +244,8 @@ def speak_openai(text, on_done, voice="alloy"):
             resp = openai.audio.speech.create(model="tts-1", voice=voice, input=spoken)
             with open("output.wav", "wb") as f:
                 f.write(resp.content)
-            subprocess.run(
-                ['ffplay','-nodisp','-autoexit','-loglevel','quiet','output.wav'],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
+            subprocess.run(['ffplay','-nodisp','-autoexit','-loglevel','quiet','output.wav'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
         finally:
@@ -275,65 +258,69 @@ def looks_like_weather(q: str) -> bool:
         "weather","forecast","temperature","rain","snow","wind","sunrise","sunset"
     ])
 
-# ========= Alexa-like Glow Ring =========
-class GlowRing(QWidget):
-    def __init__(self, parent=None):
+# ========= Alexa-style bottom wake bar =========
+class WakeBar(QWidget):
+    def __init__(self, parent=None, height=14):
         super().__init__(parent)
-        self.setMinimumSize(120, 120)
+        self.setFixedHeight(height)
+        self._active = False
         self._phase = 0.0
-        self._active = True
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(30)  # ~33 fps
+        self.hide()
 
-    def setActive(self, active: bool):
+    def showActive(self, active: bool):
         self._active = active
-
-    def sizeHint(self):
-        return QSize(140, 140)
+        if active:
+            self._phase = 0.0
+            self._timer.start(30)
+            self.show()
+        else:
+            self._timer.stop()
+            self.hide()
+        self.update()
 
     def _tick(self):
-        # Pulse speed
-        self._phase = (self._phase + (0.10 if self._active else 0.03)) % (2*math.pi)
+        self._phase = (self._phase + 0.12) % (2*math.pi)
         self.update()
 
     def paintEvent(self, event):
+        if not self._active: return
         w, h = self.width(), self.height()
-        r = min(w, h) * 0.45
-        cx, cy = w / 2.0, h / 2.0
-
-        # Pulse magnitude
-        pulse = (math.sin(self._phase) + 1) * 0.5  # 0..1
-        outer = r + 6 + 12*pulse if self._active else r + 4 + 4*pulse
-
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
+        alpha = int(80 + (math.sin(self._phase) + 1) * 0.5 * 160)
+        grad = QLinearGradient(0, 0, w, 0)
+        grad.setColorAt(0.0, QColor(0, 170, 255, alpha))
+        grad.setColorAt(0.5, QColor(0, 210, 255, min(255, alpha+25)))
+        grad.setColorAt(1.0, QColor(0, 150, 255, alpha))
+        p.fillRect(0, 0, w, h, grad)
 
-        # Outer glow ring
-        grad = QRadialGradient(cx, cy, outer, cx, cy)
-        # Alexa-like teal/blue glow
-        base = QColor(0, 200, 255) if self._active else QColor(80, 160, 200)
-        grad.setColorAt(0.0, base)
-        grad.setColorAt(0.4, QColor(0, 140, 255, 180))
-        grad.setColorAt(0.7, QColor(0, 90, 220, 120))
-        grad.setColorAt(1.0, QColor(0, 0, 0, 0))
-        p.setBrush(grad)
-        p.setPen(Qt.NoPen)
-        p.drawEllipse(int(cx-outer), int(cy-outer), int(outer*2), int(outer*2))
+# ========= Clock (Echo Show vibe) =========
+class ClockWidget(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.setStyleSheet("color:#e8f2ff;")
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(1000)
+        self._tick()
 
-        # Inner solid core
-        inner = r
-        core = QRadialGradient(cx, cy, inner, cx, cy)
-        core.setColorAt(0.0, QColor(20, 40, 80))
-        core.setColorAt(1.0, QColor(10, 20, 45))
-        p.setBrush(core)
-        p.drawEllipse(int(cx-inner), int(cy-inner), int(inner*2), int(inner*2))
+    def _tick(self):
+        t = QTime.currentTime().toString("h:mm AP")
+        d = QDate.currentDate().toString("dddd, MMMM d")
+        self.setText(f"{t}  •  {d}")
+        f = QFont("Segoe UI", 20, QFont.Medium)
+        self.setFont(f)
 
 # ========= Mic Listener Thread =========
 class MicListener(QThread):
-    append = pyqtSignal(str)       # for UI log lines
-    query = pyqtSignal(str)        # when we captured a question to process
-    exit_signal = pyqtSignal()     # when user says 'q' by voice
+    append = pyqtSignal(str)
+    query = pyqtSignal(str)
+    exit_signal = pyqtSignal()
+    wake = pyqtSignal()       # emitted when "GPT" is detected
+    status = pyqtSignal(str)  # "listening"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -346,8 +333,8 @@ class MicListener(QThread):
     def run(self):
         while self._running:
             if not self.listening_enabled:
-                self.msleep(50)
-                continue
+                self.msleep(50); continue
+            self.status.emit("Listening")
             self.append.emit("Listening… (say: 'GPT, hello')")
             try:
                 with mic as source:
@@ -367,11 +354,10 @@ class MicListener(QThread):
                     continue
 
                 if heard.strip().lower() == "q":
-                    self.append.emit("Goodbye!")
-                    self.exit_signal.emit()
-                    return
+                    self.append.emit("Goodbye!"); self.exit_signal.emit(); return
 
                 if contains_wake(heard):
+                    self.wake.emit()  # <-- show the blue bar
                     remainder = split_after_wake(heard)
                     if remainder:
                         self.query.emit(remainder)
@@ -388,9 +374,7 @@ class MicListener(QThread):
                             try:
                                 q = recognizer.recognize_google(audio2, language="en-US").strip()
                                 if q.lower() == "q":
-                                    self.append.emit("Goodbye!")
-                                    self.exit_signal.emit()
-                                    return
+                                    self.append.emit("Goodbye!"); self.exit_signal.emit(); return
                                 if q:
                                     self.query.emit(q)
                             except sr.UnknownValueError:
@@ -405,143 +389,178 @@ class MicListener(QThread):
                 self.append.emit(f"Mic error: {e}")
                 continue
 
-# ========= Main Window (PyQt) =========
+# ========= Main Window (Alexa screen styling) =========
 class AskZacWindow(QMainWindow):
     appendSignal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AskZac")
-        self.setMinimumSize(760, 480)
-        # Alexa-like dark gradient background via stylesheet
+        # Alexa-like deep blue gradient background
         self.setStyleSheet("""
             QMainWindow { background: qlineargradient(x1:0,y1:0, x2:0,y2:1,
-                                stop:0 #0b132b, stop:1 #1c2541); }
+                                stop:0 #0a1026, stop:0.6 #0d1a3a, stop:1 #0b1631); }
             QLabel#title {
-                color: #d9e8ff; font-size: 22px; font-weight: 600;
-                letter-spacing: 0.8px;
+                color: #e8f2ff; font-size: 38px; font-weight: 700; letter-spacing: 0.6px;
+            }
+            QLabel#status {
+                color: #9fd7ff; font-size: 18px; font-weight: 500;
             }
             QTextEdit {
-                background: rgba(10, 18, 40, 0.75);
-                color: #e9f3ff; border: 1px solid rgba(0,180,255,0.25);
-                border-radius: 10px; padding: 8px;
-                font-family: Consolas, "Fira Code", monospace;
-                font-size: 13px;
+                background: rgba(12, 24, 58, 0.55);
+                color: #eef7ff;
+                border: 1px solid rgba(0,180,255,0.25);
+                border-radius: 22px;
+                padding: 14px;
+                font-family: Segoe UI, Roboto, "Fira Sans", Arial;
+                font-size: 16px;
             }
             QLineEdit {
-                background: #0f1a35; color: #e9f3ff;
+                background: rgba(10, 22, 48, 0.75);
+                color: #e9f3ff;
                 border: 1px solid rgba(0,180,255,0.35);
-                border-radius: 18px; padding: 8px 12px; font-size: 14px;
+                border-radius: 22px;
+                padding: 12px 16px; font-size: 16px;
             }
             QPushButton#micBtn {
-                background: #0f1a35; color: #aee8ff;
+                background: rgba(10, 22, 48, 0.85); color: #bfeaff;
                 border: 1px solid rgba(0,180,255,0.35);
-                border-radius: 18px; padding: 8px 14px; font-weight: 600;
+                border-radius: 18px; padding: 8px 16px; font-weight: 600;
             }
-            QPushButton#micBtn:hover {
-                border-color: rgba(0,220,255,0.7); color: white;
-            }
+            QPushButton#micBtn:hover { border-color: rgba(0,220,255,0.8); color: white; }
         """)
 
         central = QWidget(self)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(10)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(40, 30, 40, 24)
+        root.setSpacing(12)
 
-        self.title = QLabel("AskZac", self)
-        self.title.setObjectName("title")
-        self.title.setAlignment(Qt.AlignHCenter)
-        layout.addWidget(self.title)
+        # Top row: Title (left), Clock (right)
+        top = QHBoxLayout()
+        self.title = QLabel("AskZac", self); self.title.setObjectName("title")
+        self.title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        top.addWidget(self.title, 1)
 
-        # Glow ring + (optional) mic toggle button row
-        topRow = QHBoxLayout()
-        topRow.setSpacing(12)
+        self.clock = ClockWidget(self)
+        top.addWidget(self.clock, 0, Qt.AlignRight)
+        root.addLayout(top)
 
-        self.ring = GlowRing(self)
-        self.ring.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        topRow.addWidget(self.ring, 0, Qt.AlignHCenter)
+        # Status row
+        self.statusLabel = QLabel("Idle", self); self.statusLabel.setObjectName("status")
+        root.addWidget(self.statusLabel, 0, Qt.AlignLeft)
 
-        topRow.addStretch(1)
-
-        self.micBtn = QPushButton("Listening ON", self)
-        self.micBtn.setObjectName("micBtn")
-        self.micBtn.clicked.connect(self.toggle_listening)
-        topRow.addWidget(self.micBtn, 0, Qt.AlignVCenter)
-
-        layout.addLayout(topRow)
-
-        self.textArea = QTextEdit(self)
-        self.textArea.setReadOnly(True)
+        # Conversation card
+        self.textArea = QTextEdit(self); self.textArea.setReadOnly(True)
         self.textArea.setLineWrapMode(QTextEdit.WidgetWidth)
-        layout.addWidget(self.textArea, 1)
+        root.addWidget(self.textArea, 1)
 
+        # Input row + mic toggle
+        inputRow = QHBoxLayout()
         self.entry = QLineEdit(self)
         self.entry.setPlaceholderText("Say “GPT, …” or type here. Type q to quit.")
         self.entry.returnPressed.connect(self.on_enter)
-        layout.addWidget(self.entry)
+        inputRow.addWidget(self.entry, 1)
+
+        self.micBtn = QPushButton("Listening ON", self); self.micBtn.setObjectName("micBtn")
+        self.micBtn.clicked.connect(self.toggle_listening)
+        inputRow.addWidget(self.micBtn, 0, Qt.AlignRight)
+        root.addLayout(inputRow)
+
+        # Wake bar pinned to bottom
+        self.wakeBar = WakeBar(self, height=14)
+        root.addWidget(self.wakeBar)
 
         self.setCentralWidget(central)
-
-        # Signals for thread-safe appends
         self.appendSignal.connect(self._append)
 
-        # Mic listener thread
+        # Mic listener
         self.listener = MicListener(self)
         self.listener.append.connect(self.append)
         self.listener.query.connect(self.ask_and_speak)
         self.listener.exit_signal.connect(self.close)
+        self.listener.wake.connect(self.onWake)
+        self.listener.status.connect(lambda s: self.set_status(s))
 
         self.listening_enabled = True
         self.append("AskZac: Say 'GPT, <your message>' or type. ('q' to quit)")
+        self.set_status("Idle")
         quick_calibrate(0.6)
         self.listener.start()
 
+    # ----- Placement on second monitor -----
+    def place_on_second_monitor(self, index=SECOND_MONITOR_INDEX, fullscreen=FULLSCREEN_ON_SECOND):
+        app = QApplication.instance()
+        screens = app.screens()
+        if len(screens) > index:
+            geo = screens[index].geometry()
+            if fullscreen:
+                # occupy that screen fully (Echo Show vibe)
+                self.setGeometry(geo)
+                self.showFullScreen()
+            else:
+                self.resize(int(geo.width()*0.8), int(geo.height()*0.8))
+                x = geo.x() + (geo.width()-self.width())//2
+                y = geo.y() + (geo.height()-self.height())//3
+                self.move(x, y)
+        else:
+            # fallback: just show normally on current screen
+            if fullscreen:
+                self.showFullScreen()
+
     # ----- UI helpers -----
     def append(self, msg: str):
-        # Safe across threads
         self.appendSignal.emit(msg)
 
     def _append(self, msg: str):
         self.textArea.append(msg)
         self.textArea.moveCursor(self.textArea.textCursor().End)
 
+    def set_status(self, status: str):
+        # Alexa-like short statuses
+        self.statusLabel.setText(status)
+
     def toggle_listening(self):
         self.listening_enabled = not self.listening_enabled
         self.listener.listening_enabled = self.listening_enabled
         self.micBtn.setText("Listening ON" if self.listening_enabled else "Listening OFF")
-        self.ring.setActive(self.listening_enabled)
+        self.set_status("Listening" if self.listening_enabled else "Paused")
 
     def pause_listening(self):
         self.listening_enabled = False
         self.listener.listening_enabled = False
         self.micBtn.setText("Listening OFF")
-        self.ring.setActive(False)
+        self.set_status("Paused")
 
     def resume_listening(self):
         self.listening_enabled = True
         self.listener.listening_enabled = True
         self.micBtn.setText("Listening ON")
-        self.ring.setActive(True)
+        self.set_status("Listening")
+
+    # ----- Wake bar control -----
+    def onWake(self):
+        # Show/pulse ONLY when "GPT" is spoken
+        self.wakeBar.showActive(True)
+        QTimer.singleShot(WAKE_BAR_MS, lambda: self.wakeBar.showActive(False))
 
     # ----- Input handling -----
     def on_enter(self):
-        txt = self.entry.text().strip()
-        self.entry.clear()
+        txt = self.entry.text().strip(); self.entry.clear()
         if txt.lower() == "q":
-            self.close()
-            return
+            self.close(); return
         if txt:
             self.ask_and_speak(txt)
 
-    # ----- Core logic (same behavior as Tk) -----
+    # ----- Core logic (unchanged behavior) -----
     def ask_and_speak(self, query: str):
         self.append(f"You: {query}")
         self.append("Thinking...")
+        self.set_status("Thinking")
 
         def worker():
             answer = ask_openai(query)
 
-            # Weather-smart path (imperial units)
+            # Weather-smart path
             if answer == UNCERTAIN_TOKEN and looks_like_weather(query):
                 try:
                     w = fetch_weather_zip(USER_ZIP, tz=TZ)
@@ -550,8 +569,8 @@ class AskZacWindow(QMainWindow):
                         "tmax": float(w["tmax"][0]),
                         "tmin": float(w["tmin"][0]),
                         "popmax": int(w["popmax"][0]),
-                        "precip": float(w["precip"][0]),   # inches
-                        "windmax": float(w["windmax"][0]), # mph
+                        "precip": float(w["precip"][0]),
+                        "windmax": float(w["windmax"][0]),
                         "sunrise": w["sunrise"][0],
                         "sunset": w["sunset"][0],
                     }
@@ -559,19 +578,18 @@ class AskZacWindow(QMainWindow):
                     styled = ask_openai_style_weather(summary)
                     self.append(f"AskZac: {styled}")
                     self.pause_listening()
+                    self.set_status("Speaking")
                     speak_openai(styled, on_done=lambda: self._resume_after_tts())
                     return
                 except Exception as e:
                     self.append(f"Weather fetch failed: {e}. Using web search…")
-                    # fall through to generic search synth
 
-            # Generic search → GPT synth for anything else
+            # Generic search synth
             if answer == UNCERTAIN_TOKEN:
                 self.append(f"AskZac: {UNCERTAIN_TOKEN}")
                 results = web_search_structured(query, n=SEARCH_RESULTS_N)
                 synth = ask_openai_from_search(query, results)
                 if synth == UNCERTAIN_TOKEN:
-                    # last resort: show first snippet
                     fallback = results[0]["title"] + ": " + results[0]["snippet"]
                     self.append(f"AskZac (web): {fallback}")
                     to_say = fallback
@@ -579,20 +597,27 @@ class AskZacWindow(QMainWindow):
                     self.append(f"AskZac (web): {synth}")
                     to_say = synth
                 self.pause_listening()
+                self.set_status("Speaking")
                 speak_openai(to_say, on_done=lambda: self._resume_after_tts())
                 return
 
             # Normal path
             self.append(f"AskZac: {answer}")
             self.pause_listening()
+            self.set_status("Speaking")
             speak_openai(answer, on_done=lambda: self._resume_after_tts())
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _resume_after_tts(self):
         self.resume_listening()
+        self.set_status("Listening")
 
-    # ----- Cleanup -----
+    # Exit full-screen with Esc (handy when FULLSCREEN_ON_SECOND=True)
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape and self.isFullScreen():
+            self.showNormal()
+
     def closeEvent(self, event):
         try:
             self.listener.stop()
@@ -603,9 +628,9 @@ class AskZacWindow(QMainWindow):
 
 # ====== Main ======
 if __name__ == "__main__":
-    # Optional: position near top-right like your Tk geometry did (+1920,+0)
     app = QApplication(sys.argv)
     win = AskZacWindow()
-    # win.move(1920, 0)  # uncomment if you want to place on a second monitor
-    win.show()
+    # Show then move/maximize to second monitor like an Alexa screen
+    win.show()  # must be shown before moving to another screen
+    win.place_on_second_monitor(index=SECOND_MONITOR_INDEX, fullscreen=FULLSCREEN_ON_SECOND)
     sys.exit(app.exec_())
