@@ -1,4 +1,4 @@
-import sys, os, re, difflib, time, threading, subprocess, json
+import sys, os, re, difflib, time, threading, subprocess, json, queue, platform, shutil
 sys.stderr = open(os.devnull, 'w')
 os.environ["JACK_NO_MSG"] = "1"
 os.environ["SDL_JACK_NO_MSG"] = "1"
@@ -9,7 +9,17 @@ os.environ["ALSA_DEBUG"] = "0"
 os.environ.setdefault("PYWEBVIEW_GUI", "qt")
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")  # use 'wayland' if you prefer
 
-import openai
+# OpenAI client compat (works with both old and new SDKs)
+try:
+    from openai import OpenAI
+    _oa_client = OpenAI()
+    def chat_create(**kw): return _oa_client.chat.completions.create(**kw)
+    def tts_create(**kw):  return _oa_client.audio.speech.create(**kw)
+except Exception:
+    import openai
+    def chat_create(**kw): return openai.chat.completions.create(**kw)
+    def tts_create(**kw):  return openai.audio.speech.create(**kw)
+
 import speech_recognition as sr
 from dotenv import load_dotenv
 import requests
@@ -41,14 +51,19 @@ WIN_HEIGHT       = 560
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
-openai.api_key = OPENAI_API_KEY
+if 'openai' in sys.modules:
+    try:
+        import openai as _openai_legacy
+        _openai_legacy.api_key = OPENAI_API_KEY
+    except Exception:
+        pass
 
-# Speech setup
+# ---------- Audio helpers ----------
 recognizer = sr.Recognizer()
 recognizer.pause_threshold = 0.25
 recognizer.non_speaking_duration = 0.2
 recognizer.phrase_threshold = 0.1
-recognizer.dynamic_energy_threshold = False
+recognizer.dynamic_energy_threshold = True
 recognizer.energy_threshold = 300
 mic = sr.Microphone()
 
@@ -57,6 +72,32 @@ def quick_calibrate(seconds=0.6):
         with mic as source:
             recognizer.adjust_for_ambient_noise(source, duration=seconds)
             recognizer.energy_threshold = max(150, recognizer.energy_threshold)
+    except Exception:
+        pass
+
+def _which(cmd): return shutil.which(cmd) is not None
+
+def _play_wav(path: str):
+    """Cross-platform playback with fallbacks (Windows/Linux/macOS)."""
+    try:
+        if os.name == "nt":
+            # PowerShell SoundPlayer (no dependencies)
+            cmd = [
+                "powershell","-NoProfile","-Command",
+                f"[console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+                f"$p=New-Object System.Media.SoundPlayer('{os.path.abspath(path)}');$p.PlaySync();"
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        # Linux/macOS
+        if _which("ffplay"):
+            subprocess.run(["ffplay","-nodisp","-autoexit","-loglevel","quiet", path],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            return
+        if _which("afplay"):  # macOS
+            subprocess.run(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False); return
+        if _which("aplay"):   # Linux ALSA
+            subprocess.run(["aplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False); return
     except Exception:
         pass
 
@@ -185,7 +226,6 @@ DICT_SYNONYM_PATTERNS = [
 ]
 DICT_ANTONYM_PATTERNS = [
     r"^\s*(antonyms?|ants?)\s+(for|of)\s+(?P<term>.+?)\s*\??$",
-    r"^\s*what\s+are\s+antonyms?\s+(for|of)\s+(?P<term>.+?)\s*\??$",
 ]
 DICT_PRONOUNCE_PATTERNS = [
     r"^\s*(pronounce|pronunciation of)\s+(?P<term>.+?)\s*\??$",
@@ -303,6 +343,19 @@ def format_dictionary_response(mode: str, term: str, info: dict) -> str:
 # -------------------------------------
 
 # ---------- GPT helpers ----------
+def _extract_json_maybe(s: str):
+    """Router sometimes returns junk. Try to salvage first {...} block."""
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    try:
+        i = s.find('{'); j = s.rfind('}')
+        if i != -1 and j != -1 and j > i:
+            return json.loads(s[i:j+1])
+    except Exception:
+        return None
+
 def ask_router(query: str) -> dict:
     try:
         msg = {
@@ -316,7 +369,7 @@ def ask_router(query: str) -> dict:
                 "tie_breaker": "if unsure between answer and search, choose search"
             }
         }
-        resp = openai.chat.completions.create(
+        resp = chat_create(
             model=ROUTER_MODEL,
             temperature=0,
             messages=[
@@ -328,7 +381,7 @@ def ask_router(query: str) -> dict:
             max_tokens=80
         )
         raw = (resp.choices[0].message.content or "").strip()
-        data = json.loads(raw)
+        data = _extract_json_maybe(raw) or {}
         act = (data.get("action") or "").lower()
         if act not in {"dict","weather","search","answer"}:
             return {"action":"answer"}
@@ -338,7 +391,7 @@ def ask_router(query: str) -> dict:
 
 def ask_openai_answer(prompt):
     try:
-        resp = openai.chat.completions.create(
+        resp = chat_create(
             model=ANSWER_MODEL,
             temperature=0,
             messages=[
@@ -360,7 +413,7 @@ def ask_openai_answer(prompt):
 def ask_openai_style_weather(summary_dict):
     try:
         msg = json.dumps(summary_dict)
-        resp = openai.chat.completions.create(
+        resp = chat_create(
             model=ANSWER_MODEL,
             temperature=0.3,
             messages=[
@@ -385,7 +438,7 @@ def ask_openai_style_weather(summary_dict):
 def ask_openai_from_search(query, results):
     try:
         payload = {"query": query, "results": results}
-        resp = openai.chat.completions.create(
+        resp = chat_create(
             model=ANSWER_MODEL,
             temperature=0.2,
             messages=[
@@ -402,17 +455,15 @@ def ask_openai_from_search(query, results):
         return text
     except Exception:
         return UNCERTAIN_TOKEN
-# -----------------------------------
 
 def speak_openai(text, on_done, voice="alloy"):
     def tts_thread():
         try:
             spoken = text.strip() if text and text.strip() else "Sorry, I don't know."
-            resp = openai.audio.speech.create(model="tts-1", voice=voice, input=spoken)
+            resp = tts_create(model="tts-1", voice=voice, input=spoken)
             with open("output.wav", "wb") as f:
                 f.write(resp.content)
-            subprocess.run(['ffplay','-nodisp','-autoexit','-loglevel','quiet','output.wav'],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _play_wav("output.wav")
         except Exception:
             pass
         finally:
@@ -554,11 +605,14 @@ function py_add_msg(role, text, meta_json) {
 </html>
 """
 
-# ===================== App wrapper =====================
+# ===================== App wrapper (ALWAYS LISTEN via background) =====================
 class AskZacApp:
     def __init__(self, window: webview.Window):
         self.window = window
         self.listening_enabled = True
+        self.requests_q = queue.Queue()
+        self.stop_bg = None
+        self._lock = threading.Lock()  # serialize processing
 
     def ui_add(self, role, text, meta=None):
         meta_s = json.dumps(meta or {})
@@ -569,123 +623,110 @@ class AskZacApp:
         except Exception:
             pass
 
-    def start_mic_loop(self):
-        threading.Thread(target=self.continuous_loop, daemon=True).start()
+    # ---- Background listening ----
+    def start_background(self):
+        # consumer loop
+        threading.Thread(target=self._process_queue_loop, daemon=True).start()
+        # ASR background
+        self._start_bg_listener()
 
-    def continuous_loop(self):
-        while True:
-            if not self.listening_enabled:
-                time.sleep(0.05); continue
-            self.ui_add("bot", "Listening… (say: 'GPT, …')", {"route":"system"})
+    def _start_bg_listener(self):
+        if self.stop_bg is not None:
+            return
+        try:
+            self.stop_bg = recognizer.listen_in_background(
+                mic, self._asr_callback, phrase_time_limit=WAKE_PHRASE_MAXS
+            )
+        except Exception as e:
+            self.ui_add("bot", f"Mic start error: {e}", {"route":"system"})
+            self.stop_bg = None
+
+    def _stop_bg_listener(self):
+        if self.stop_bg:
             try:
-                with mic as source:
-                    recognizer.adjust_for_ambient_noise(source, duration=0.2)
-                    audio = recognizer.listen(source, timeout=WAKE_TIMEOUT_S, phrase_time_limit=WAKE_PHRASE_MAXS)
-                try:
-                    heard = recognizer.recognize_google(audio, language="en-US")
-                    self.ui_add("bot", f"You said: {heard}", {"route":"system"})
-                except sr.UnknownValueError:
-                    continue
-                except sr.RequestError as e:
-                    self.ui_add("bot", f"ASR error: {e}", {"route":"system"})
-                    continue
+                self.stop_bg(wait_for_stop=False)
+            except Exception:
+                pass
+            self.stop_bg = None
 
-                if heard.strip().lower() == "q":
-                    self.ui_add("bot", "Goodbye!", {"route":"system"})
-                    os._exit(0)
+    def _asr_callback(self, recognizer_obj, audio_obj):
+        if not self.listening_enabled:
+            return
+        try:
+            heard = recognizer_obj.recognize_google(audio_obj, language="en-US").strip()
+        except sr.UnknownValueError:
+            return
+        except Exception as e:
+            self.ui_add("bot", f"ASR error: {e}", {"route":"system"})
+            return
+        # Enqueue recognized text for processing
+        self.requests_q.put(heard)
 
-                if contains_wake(heard):
-                    remainder = split_after_wake(heard)
-                    if remainder:
-                        self.ask_and_speak(remainder)
-                    else:
-                        self.ui_add("bot", "Heard 'GPT'. What's up?", {"route":"system"})
+    def _process_queue_loop(self):
+        while True:
+            heard = self.requests_q.get()
+            if not heard:
+                continue
+            self.ui_add("bot", f"You said: {heard}", {"route":"system"})
+
+            lt = heard.strip().lower()
+            if lt == "q":
+                self.ui_add("bot", "Goodbye!", {"route":"system"}); os._exit(0)
+
+            if contains_wake(heard):
+                remainder = split_after_wake(heard)
+                if remainder:
+                    self.ask_and_speak(remainder)
+                else:
+                    # Temporary blocking follow-up capture
+                    self.ui_add("bot", "Heard 'GPT'. What's up?", {"route":"system"})
+                    try:
+                        self._stop_bg_listener()
+                        with mic as source:
+                            recognizer.adjust_for_ambient_noise(source, duration=0.2)
+                            audio2 = recognizer.listen(source, timeout=QUESTION_TIMEOUT, phrase_time_limit=QUESTION_MAXS)
                         try:
-                            with mic as source:
-                                recognizer.adjust_for_ambient_noise(source, duration=0.2)
-                                audio2 = recognizer.listen(source, timeout=QUESTION_TIMEOUT, phrase_time_limit=QUESTION_MAXS)
-                            try:
-                                q = recognizer.recognize_google(audio2, language="en-US").strip()
-                                if q.lower() == "q":
-                                    self.ui_add("bot", "Goodbye!", {"route":"system"})
-                                    os._exit(0)
-                                if q:
-                                    self.ask_and_speak(q)
-                            except sr.UnknownValueError:
-                                self.ui_add("bot", "Didn't catch that—try again with 'GPT, …'", {"route":"system"})
-                            except sr.RequestError as e:
-                                self.ui_add("bot", f"ASR error: {e}", {"route":"system"})
-                        except sr.WaitTimeoutError:
-                            self.ui_add("bot", "Timed out—say 'GPT, …' again.", {"route":"system"})
-            except sr.WaitTimeoutError:
-                continue
-            except Exception as e:
-                self.ui_add("bot", f"Mic error: {e}", {"route":"system"})
-                continue
+                            q = recognizer.recognize_google(audio2, language="en-US").strip()
+                            if q.lower() == "q":
+                                self.ui_add("bot", "Goodbye!", {"route":"system"}); os._exit(0)
+                            if q:
+                                self.ask_and_speak(q)
+                        except sr.UnknownValueError:
+                            self.ui_add("bot", "Didn't catch that—try again with 'GPT, …'", {"route":"system"})
+                        except sr.RequestError as e:
+                            self.ui_add("bot", f"ASR error: {e}", {"route":"system"})
+                    except sr.WaitTimeoutError:
+                        self.ui_add("bot", "Timed out—say 'GPT, …' again.", {"route":"system"})
+                    finally:
+                        self._start_bg_listener()
+            else:
+                # If you want non-wake chit-chat, handle here:
+                # self.ask_and_speak(heard)
+                # For now, ignore non-wake speech to match your original behavior.
+                pass
 
     # ---------- Routing + actions ----------
     def ask_and_speak(self, query):
-        self.ui_add("user", query)
-        self.ui_add("bot", "Thinking...", {"route":"system"})
+        with self._lock:
+            self.ui_add("user", query)
+            self.ui_add("bot", "Thinking...", {"route":"system"})
 
-        route = ask_router(query)
-        action = (route.get("action") or "answer").lower()
+            route = ask_router(query)
+            action = (route.get("action") or "answer").lower()
 
-        if action == "dict":
-            term = route.get("term")
-            mode, parsed_term = parse_dictionary_query(query)
-            term = term or parsed_term
-            info = fetch_dictionary(term)
-            if info:
-                resp = format_dictionary_response(mode, term, info)
-                self.ui_add("bot", resp, {"route":"dict"})
-                self.listening_enabled = False
-                speak_openai(resp, on_done=lambda: self._resume_after_tts())
-                return
-            else:
-                action = "search"  # fallback
+            if action == "dict":
+                term = route.get("term")
+                mode, parsed_term = parse_dictionary_query(query)
+                term = term or parsed_term
+                info = fetch_dictionary(term)
+                if info:
+                    resp = format_dictionary_response(mode, term, info)
+                    self._speak_with_ducking(resp, route="dict")
+                    return
+                else:
+                    action = "search"  # fallback
 
-        if action == "weather" or (action == "search" and looks_like_weather(query)):
-            try:
-                w = fetch_weather_zip(USER_ZIP, tz=TZ)
-                today = {
-                    "date": w["dates"][0],
-                    "tmax": float(w["tmax"][0]),
-                    "tmin": float(w["tmin"][0]),
-                    "popmax": int(w["popmax"][0]),
-                    "precip": float(w["precip"][0]),
-                    "windmax": float(w["windmax"][0]),
-                    "sunrise": w["sunrise"][0],
-                    "sunset": w["sunset"][0],
-                }
-                summary = {"zip": USER_ZIP, "place": w["place"], "today": today}
-                styled = ask_openai_style_weather(summary)
-                self.ui_add("bot", styled, {"route":"weather"})
-                self.listening_enabled = False
-                speak_openai(styled, on_done=lambda: self._resume_after_tts())
-                return
-            except Exception as e:
-                self.ui_add("bot", f"Weather fetch failed: {e}. Continuing…", {"route":"system"})
-
-        if action == "search":
-            q = route.get("query") or query
-            results = web_search_structured(q, n=SEARCH_RESULTS_N)
-            synth = ask_openai_from_search(q, results)
-            if synth == UNCERTAIN_TOKEN:
-                fallback = (results[0]["title"] + ": " + results[0]["snippet"]) if results else "No results."
-                self.ui_add("bot", fallback, {"route":"search", "searchResults": results})
-                to_say = fallback
-            else:
-                self.ui_add("bot", synth, {"route":"search", "searchResults": results})
-                to_say = synth
-            self.listening_enabled = False
-            speak_openai(to_say, on_done=lambda: self._resume_after_tts())
-            return
-
-        # Default direct answer
-        answer = ask_openai_answer(query)
-        if answer == UNCERTAIN_TOKEN:
-            if looks_like_weather(query):
+            if action == "weather" or (action == "search" and looks_like_weather(query)):
                 try:
                     w = fetch_weather_zip(USER_ZIP, tz=TZ)
                     today = {
@@ -700,31 +741,69 @@ class AskZacApp:
                     }
                     summary = {"zip": USER_ZIP, "place": w["place"], "today": today}
                     styled = ask_openai_style_weather(summary)
-                    self.ui_add("bot", styled, {"route":"weather"})
-                    self.listening_enabled = False
-                    speak_openai(styled, on_done=lambda: self._resume_after_tts())
+                    self._speak_with_ducking(styled, route="weather")
                     return
-                except Exception:
-                    pass
-            results = web_search_structured(query, n=SEARCH_RESULTS_N)
-            synth = ask_openai_from_search(query, results)
-            if synth == UNCERTAIN_TOKEN:
-                fallback = (results[0]["title"] + ": " + results[0]["snippet"]) if results else "No results."
-                self.ui_add("bot", fallback, {"route":"search", "searchResults": results})
-                to_say = fallback
-            else:
-                self.ui_add("bot", synth, {"route":"search", "searchResults": results})
-                to_say = synth
-            self.listening_enabled = False
-            speak_openai(to_say, on_done=lambda: self._resume_after_tts())
-            return
+                except Exception as e:
+                    self.ui_add("bot", f"Weather fetch failed: {e}. Continuing…", {"route":"system"})
 
-        self.ui_add("bot", answer, {"route":"answer"})
+            if action == "search":
+                q = route.get("query") or query
+                results = web_search_structured(q, n=SEARCH_RESULTS_N)
+                synth = ask_openai_from_search(q, results)
+                if synth == UNCERTAIN_TOKEN:
+                    fallback = (results[0]["title"] + ": " + results[0]["snippet"]) if results else "No results."
+                    self._speak_with_ducking(fallback, route="search", extra={"searchResults": results})
+                else:
+                    self._speak_with_ducking(synth, route="search", extra={"searchResults": results})
+                return
+
+            # Default direct answer
+            answer = ask_openai_answer(query)
+            if answer == UNCERTAIN_TOKEN:
+                if looks_like_weather(query):
+                    try:
+                        w = fetch_weather_zip(USER_ZIP, tz=TZ)
+                        today = {
+                            "date": w["dates"][0],
+                            "tmax": float(w["tmax"][0]),
+                            "tmin": float(w["tmin"][0]),
+                            "popmax": int(w["popmax"][0]),
+                            "precip": float(w["precip"][0]),
+                            "windmax": float(w["windmax"][0]),
+                            "sunrise": w["sunrise"][0],
+                            "sunset": w["sunset"][0],
+                        }
+                        summary = {"zip": USER_ZIP, "place": w["place"], "today": today}
+                        styled = ask_openai_style_weather(summary)
+                        self._speak_with_ducking(styled, route="weather")
+                        return
+                    except Exception:
+                        pass
+                results = web_search_structured(query, n=SEARCH_RESULTS_N)
+                synth = ask_openai_from_search(query, results)
+                if synth == UNCERTAIN_TOKEN:
+                    fallback = (results[0]["title"] + ": " + results[0]["snippet"]) if results else "No results."
+                    self._speak_with_ducking(fallback, route="search", extra={"searchResults": results})
+                else:
+                    self._speak_with_ducking(synth, route="search", extra={"searchResults": results})
+                return
+
+            self._speak_with_ducking(answer, route="answer")
+
+    def _speak_with_ducking(self, text, route="answer", extra=None):
+        meta = {"route": route}
+        if extra: meta.update(extra)
+        self.ui_add("bot", text, meta)
+        # Pause background listening while TTS plays
         self.listening_enabled = False
-        speak_openai(answer, on_done=lambda: self._resume_after_tts())
+        self._stop_bg_listener()
+        speak_openai(text, on_done=self._resume_after_tts)
 
     def _resume_after_tts(self):
+        # Small delay to avoid capturing playback tail
+        time.sleep(0.15)
         self.listening_enabled = True
+        self._start_bg_listener()
 
 # JS API object for the page
 class UIApi:
@@ -743,15 +822,13 @@ def on_webview_ready():
         pass
     quick_calibrate(0.6)
     app.ui_add("bot", "AskZac: Say 'GPT, <your message>' or type. ('q' to quit)", {"route":"system"})
-    app.start_mic_loop()
+    app.start_background()
 
 if __name__ == "__main__":
     if not OPENAI_API_KEY:
         print("ERROR: Set OPENAI_API_KEY in .env"); sys.exit(1)
 
-    # Create API first, pass to window, then wire in the app
     api = UIApi(None)
-
     window = webview.create_window(
         title="AskZac",
         html=INDEX_HTML,
@@ -762,13 +839,10 @@ if __name__ == "__main__":
         easy_drag=False,
         text_select=True,
         zoomable=True,
-        js_api=api,   # << v4 style
+        js_api=api,
     )
 
-    # hook the app after window is created so we can call evaluate_js
     app = AskZacApp(window)
-    # swap in the real app instance for JS API
     api.app = app
 
-    # Force Qt like your working test
     webview.start(on_webview_ready, window, debug=False, gui='qt')
