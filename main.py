@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# Alexa-style full-screen UI on monitor #2, blue wake bar at bottom that appears
-# ONLY when the user says "GPT". Now: weather + search results are ALWAYS
-# phrased via ChatGPT (no raw snippets).
+# Alexa-style full-screen UI on monitor #2, wake bar shows state:
+# Blue while user is speaking, fades into orange while thinking,
+# and smoothly fades to transparent while speaking.
 
 import sys, os, re, difflib, time, threading, subprocess, json, math
 sys.stderr = open(os.devnull, 'w')
@@ -37,7 +37,6 @@ TZ               = "America/New_York"
 SEARCH_RESULTS_N = 3
 SECOND_MONITOR_INDEX = 1      # 0=primary, 1=second
 FULLSCREEN_ON_SECOND = True   # Alexa-style: full-screen
-WAKE_BAR_MS = 1600            # how long the wake bar pulses after "GPT"
 # ===========================================
 
 # ====== Env / API ======
@@ -199,7 +198,7 @@ def ask_openai_style_weather(summary_dict):
     """Always phrase weather nicely (no raw numbers)."""
     try:
         msg = json.dumps(summary_dict)
-        resp = openai.chat_completions.create(  # intentionally unchanged API call style if you had it correct earlier
+        resp = openai.chat_completions.create(  # keep as-is per your current code
             model="gpt-4o",
             temperature=0.2,
             messages=[
@@ -234,7 +233,7 @@ def ask_openai_from_search(query, results):
             max_tokens=180
         )
         text = (resp.choices[0].message.content or "").strip()
-        if text and text.lower() not in {UNCERTAIN_TOKEN, "<i dont know>", "<i_dont_know>", "<idontknow>"}:
+        if text and text.lower() not in {UNCERTAIN_TOKEN, "<i dont know>", "<i_dont_know>", "<idontnow>"}:
             return text
         return UNCERTAIN_TOKEN
     except Exception:
@@ -280,22 +279,55 @@ def looks_like_weather(q: str) -> bool:
         "weather","forecast","temperature","rain","snow","wind","sunrise","sunset"
     ])
 
-# ========= Alexa-style bottom wake bar =========
+# ========= State-aware Wake Bar =========
 class WakeBar(QWidget):
+    """Modes:
+       - 'off'      : hidden
+       - 'listen'   : solid blue (breathing)
+       - 'think'    : cross-fade blue -> orange and stay visible
+       - 'speaking' : keep orange and fade opacity smoothly to 0 (still animating)
+    """
     def __init__(self, parent=None, height=18):
         super().__init__(parent)
         self.setFixedHeight(height)
         self._active = False
         self._t = 0.0
+        self._mode = 'off'
+        self._orange_mix = 0.0  # 0=blue, 1=orange
+        self._fade = 0.0        # 0=opaque, 1=transparent
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self.hide()
+
+    def setMode(self, mode: str):
+        mode = mode.lower()
+        if mode == 'off':
+            self._mode = 'off'
+            self._orange_mix = 0.0
+            self._fade = 0.0
+            self.showActive(False)
+            return
+
+        self._mode = mode
+        if mode == 'listen':
+            self._orange_mix = 0.0
+            self._fade = 0.0
+        elif mode == 'think':
+            # start from blue and crossfade to orange
+            self._fade = 0.0
+            # keep whatever current mix is (if coming from listen it's 0.0)
+        elif mode == 'speaking':
+            # force orange, then fade alpha to 0 while keeping animation running
+            self._orange_mix = 1.0
+            self._fade = 0.0
+
+        self.showActive(True)
 
     def showActive(self, active: bool):
         self._active = active
         if active:
             self._t = 0.0
-            self._timer.start(16)  # smoother animation (~60fps)
+            self._timer.start(16)  # ~60fps
             self.show()
         else:
             self._timer.stop()
@@ -304,7 +336,28 @@ class WakeBar(QWidget):
 
     def _tick(self):
         self._t += 0.035
+
+        if self._mode == 'think':
+            # crossfade to orange over ~0.6–0.8s
+            self._orange_mix = min(1.0, self._orange_mix + 0.05)
+            self._fade = 0.0
+        elif self._mode == 'speaking':
+            # smoothly fade to transparent over ~0.8s (but keep animating)
+            self._fade = min(1.0, self._fade + 0.04)
+
+        # keep animating even when fully transparent to avoid the "freeze" look
         self.update()
+
+    def _mix(self, a: int, b: int, t: float) -> int:
+        return int(round(a + (b - a) * t))
+
+    def _mixColor(self, c1: QColor, c2: QColor, t: float, alpha: int) -> QColor:
+        return QColor(
+            self._mix(c1.red(),   c2.red(),   t),
+            self._mix(c1.green(), c2.green(), t),
+            self._mix(c1.blue(),  c2.blue(),  t),
+            alpha
+        )
 
     def paintEvent(self, event):
         if not self._active:
@@ -313,7 +366,7 @@ class WakeBar(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
 
-        # --- Alexa-like undulating top edge ---
+        # --- Top edge waveform ---
         path = QPainterPath()
         amp = max(2.0, h * 0.35)
         freq = 2.0
@@ -328,28 +381,47 @@ class WakeBar(QWidget):
         path.lineTo(w, h)
         path.closeSubpath()
 
-        # --- Core cyan/royal gradient (Alexa vibe) ---
+        # breathing base alpha
         pulse = 0.6 + 0.4 * math.sin(self._t * 2.0)
         base_alpha = int(150 + 70 * pulse)
+        # apply fade opacity
+        base_alpha = int(base_alpha * (1.0 - self._fade))
+
+        # Palettes
+        blue_left  = QColor(26, 116, 240)
+        blue_mid   = QColor(0, 201, 255)
+        blue_right = QColor(26, 116, 240)
+
+        orange_left  = QColor(255, 149, 0)
+        orange_mid   = QColor(255, 196, 0)
+        orange_right = QColor(255, 149, 0)
+
+        tcol = self._orange_mix  # 0=blue, 1=orange
+
         grad = QLinearGradient(0, 0, w, 0)
-        grad.setColorAt(0.00, QColor(26, 116, 240, base_alpha))
-        grad.setColorAt(0.50, QColor(0, 201, 255, min(255, base_alpha + 25)))
-        grad.setColorAt(1.00, QColor(26, 116, 240, base_alpha))
+        grad.setColorAt(0.00, self._mixColor(blue_left,  orange_left,  tcol, base_alpha))
+        grad.setColorAt(0.50, self._mixColor(blue_mid,   orange_mid,   tcol, min(255, base_alpha + 25)))
+        grad.setColorAt(1.00, self._mixColor(blue_right, orange_right, tcol, base_alpha))
         p.fillPath(path, grad)
 
-        # --- Traveling "comet" highlight ---
+        # "comet" highlight mixes cyan -> warm
+        comet_blue_inner = QColor(200, 255, 255)
+        comet_blue_mid   = QColor(0, 220, 255)
+        comet_warm_inner = QColor(255, 230, 200)
+        comet_warm_mid   = QColor(255, 170, 60)
+
         cx = (0.5 * (math.sin(self._t * 1.4) + 1.0)) * w
         comet = QRadialGradient(cx, h * 0.55, h * 1.8)
-        comet.setColorAt(0.00, QColor(200, 255, 255, 200))
-        comet.setColorAt(0.40, QColor(0, 220, 255, 150))
-        comet.setColorAt(1.00, QColor(0, 220, 255, 0))
+        comet.setColorAt(0.00, self._mixColor(comet_blue_inner, comet_warm_inner, tcol, int(200 * (1.0 - self._fade))))
+        comet.setColorAt(0.40, self._mixColor(comet_blue_mid,   comet_warm_mid,   tcol, int(150 * (1.0 - self._fade))))
+        comet.setColorAt(1.00, self._mixColor(QColor(0,0,0,0),  QColor(0,0,0,0),  0.0, 0))
         p.setBrush(comet)
         p.setPen(Qt.NoPen)
         p.drawPath(path)
 
-        # --- Subtle top edge glow ---
-        p.setOpacity(0.9)
-        p.strokePath(path, QPen(QColor(0, 230, 255, 180), 2))
+        # subtle top edge glow
+        p.setOpacity(0.9 * (1.0 - self._fade))
+        p.strokePath(path, QPen(self._mixColor(QColor(0,230,255,180), QColor(255,190,90,180), tcol, 180), 2))
 
 # ========= Clock (Echo Show vibe) =========
 class ClockWidget(QLabel):
@@ -417,7 +489,7 @@ class MicListener(QThread):
                     return
 
                 if contains_wake(heard):
-                    self.wake.emit()  # <-- show the blue bar
+                    self.wake.emit()  # show blue bar (listen mode)
                     remainder = split_after_wake(heard)
                     if remainder:
                         self.query.emit(remainder)
@@ -483,7 +555,7 @@ class AskZacWindow(QMainWindow):
         root.setContentsMargins(40, 30, 40, 24)
         root.setSpacing(12)
 
-        # --- centered clock (replaces previous top HBox with title/clock) ---
+        # centered clock
         self.clock = ClockWidget(self)
         root.addWidget(self.clock, 0, Qt.AlignHCenter)
 
@@ -539,37 +611,35 @@ class AskZacWindow(QMainWindow):
         self.appendSignal.emit(msg)
 
     def _append(self, msg: str):
-        self.textArea.append(msg)
+        # Replace previous content so the screen doesn't get clogged
+        self.textArea.clear()
+        self.textArea.setText(msg)
         self.textArea.moveCursor(self.textArea.textCursor().End)
 
     def set_status(self, status: str):
         self.statusLabel.setText(status)
 
-    def toggle_listening(self):
-        self.listening_enabled = not self.listening_enabled
-        self.listener.listening_enabled = self.listening_enabled
-        self.set_status("Listening" if self.listening_enabled else "Paused")
-
-    def pause_listening(self):
-        self.listening_enabled = False
-        self.listener.listening_enabled = False
-        self.set_status("Paused")
-
-    def resume_listening(self):
-        self.listening_enabled = True
-        self.listener.listening_enabled = True
-        self.set_status("Listening")
-
     # ----- Wake bar control -----
     def onWake(self):
-        self.wakeBar.showActive(True)
-        QTimer.singleShot(WAKE_BAR_MS, lambda: self.wakeBar.showActive(False))
+        # user just said "GPT" -> show blue bar and keep it until they stop talking
+        self.wakeBar.setMode('listen')
 
     # ----- Core logic (ALWAYS phrased via GPT) -----
     def ask_and_speak(self, query: str):
         print(f"You: {query}", flush=True)
         print("Thinking...", flush=True)
         self.set_status("Thinking")
+        self.textArea.clear()
+
+        # user stopped talking; we're about to think -> fade to orange
+        self.wakeBar.setMode('think')
+
+        def speak_and_fade(text_to_say: str):
+            # while speaking, fade the orange bar smoothly to transparent
+            self.wakeBar.setMode('speaking')
+            self.pause_listening()
+            self.set_status("Speaking")
+            speak_openai(text_to_say, on_done=lambda: self._resume_after_tts())
 
         def worker():
             answer = ask_openai(query)
@@ -591,9 +661,7 @@ class AskZacWindow(QMainWindow):
                     summary = {"zip": USER_ZIP, "place": w["place"], "today": today}
                     phrased = ask_openai_style_weather(summary)
                     self.append(f"AskZac: {phrased}")
-                    self.pause_listening()
-                    self.set_status("Speaking")
-                    speak_openai(phrased, on_done=lambda: self._resume_after_tts())
+                    speak_and_fade(phrased)
                     return
                 except Exception as e:
                     print(f"Weather fetch failed: {e}. Checking the web…", flush=True)
@@ -610,26 +678,31 @@ class AskZacWindow(QMainWindow):
                         blob = "No reliable snippets were available."
                     phrased = refine_text_with_openai(query, blob)
                     self.append(f"AskZac (web): {phrased}")
-                    to_say = phrased
+                    speak_and_fade(phrased)
                 else:
                     self.append(f"AskZac (web): {synth}")
-                    to_say = synth
-                self.pause_listening()
-                self.set_status("Speaking")
-                speak_openai(to_say, on_done=lambda: self._resume_after_tts())
+                    speak_and_fade(synth)
                 return
 
             # Normal path (already phrased answer)
             self.append(f"AskZac: {answer}")
-            self.pause_listening()
-            self.set_status("Speaking")
-            speak_openai(answer, on_done=lambda: self._resume_after_tts())
+            speak_and_fade(answer)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def pause_listening(self):
+        self.listening_enabled = False
+        self.listener.listening_enabled = False
+
+    def resume_listening(self):
+        self.listening_enabled = True
+        self.listener.listening_enabled = True
 
     def _resume_after_tts(self):
         self.resume_listening()
         self.set_status("Listening")
+        # after speaking completes, hide the (now-transparent) bar
+        self.wakeBar.setMode('off')
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape and self.isFullScreen():
