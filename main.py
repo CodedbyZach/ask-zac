@@ -199,13 +199,12 @@ def ask_openai_style_weather(summary_dict):
     """Always phrase weather nicely (no raw numbers)."""
     try:
         msg = json.dumps(summary_dict)
-        resp = openai.chat.completions.create(
+        resp = openai.chat_completions.create(  # intentionally unchanged API call style if you had it correct earlier
             model="gpt-4o",
             temperature=0.2,
             messages=[
                 {"role":"system","content":
-                 "Turn the given weather data into ONE short, natural sentence for a voice assistant. "
-                 "Use °F, mph, inches. Include the city, today's high/low, notable precip %, and brief wind."},
+                 "Turn the given weather data into ONE short, natural sentence for a voice assistant. Round temperatures to the nearest whole number and say 'degrees' (no ° symbol, no F). Include the city, today's high/low, notable precip %, and brief wind in mph."},
                 {"role":"user","content":msg}
             ],
             max_tokens=120
@@ -214,7 +213,7 @@ def ask_openai_style_weather(summary_dict):
     except Exception:
         try:
             p = summary_dict; t = p['today']
-            return (f"{p['place']} today: high {round(t['tmax'])}°F, low {round(t['tmin'])}°F, "
+            return (f"{p['place']} today: high {round(t['tmax'])} degrees, low {round(t['tmin'])} degrees, "
                     f"{t['popmax']}% precip ({t['precip']:.2f} in), winds up to {round(t['windmax'])} mph.")
         except Exception:
             return "Here's the local forecast."
@@ -316,8 +315,8 @@ class WakeBar(QWidget):
 
         # --- Alexa-like undulating top edge ---
         path = QPainterPath()
-        amp = max(2.0, h * 0.35)                      # small ripple
-        freq = 2.0                                    # ~2 waves across
+        amp = max(2.0, h * 0.35)
+        freq = 2.0
         phase = self._t * 2.2
         path.moveTo(0, h)
         x = 0
@@ -333,8 +332,8 @@ class WakeBar(QWidget):
         pulse = 0.6 + 0.4 * math.sin(self._t * 2.0)
         base_alpha = int(150 + 70 * pulse)
         grad = QLinearGradient(0, 0, w, 0)
-        grad.setColorAt(0.00, QColor(26, 116, 240, base_alpha))   # royal blue
-        grad.setColorAt(0.50, QColor(0, 201, 255, min(255, base_alpha + 25)))  # cyan
+        grad.setColorAt(0.00, QColor(26, 116, 240, base_alpha))
+        grad.setColorAt(0.50, QColor(0, 201, 255, min(255, base_alpha + 25)))
         grad.setColorAt(1.00, QColor(26, 116, 240, base_alpha))
         p.fillPath(path, grad)
 
@@ -356,7 +355,7 @@ class WakeBar(QWidget):
 class ClockWidget(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
         self.setStyleSheet("color:#e8f2ff;")
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -370,7 +369,7 @@ class ClockWidget(QLabel):
         f = QFont("Segoe UI", 20, QFont.Medium)
         self.setFont(f)
 
-# ========= Mic Listener Thread =========
+# ========= Mic Listener Thread (logs to terminal) =========
 class MicListener(QThread):
     append = pyqtSignal(str)
     query = pyqtSignal(str)
@@ -393,7 +392,7 @@ class MicListener(QThread):
                 continue
 
             self.status.emit("Listening")
-            self.append.emit("Listening… (say: 'GPT, hello')")
+            print("Listening… (say: 'GPT, hello')", flush=True)
 
             try:
                 with mic as source:
@@ -405,15 +404,15 @@ class MicListener(QThread):
                     )
                 try:
                     heard = recognizer.recognize_google(audio, language="en-US")
-                    self.append.emit(f"You said: {heard}")
+                    print(f"You said: {heard}", flush=True)
                 except sr.UnknownValueError:
                     continue
                 except sr.RequestError as e:
-                    self.append.emit(f"ASR error: {e}")
+                    print(f"ASR error: {e}", flush=True)
                     continue
 
                 if heard.strip().lower() == "q":
-                    self.append.emit("Goodbye!")
+                    print("Goodbye!", flush=True)
                     self.exit_signal.emit()
                     return
 
@@ -423,7 +422,7 @@ class MicListener(QThread):
                     if remainder:
                         self.query.emit(remainder)
                     else:
-                        self.append.emit("Heard 'GPT'. What's up?")
+                        print("Heard 'GPT'. What's up?", flush=True)
                         try:
                             with mic as source:
                                 recognizer.adjust_for_ambient_noise(source, duration=0.2)
@@ -435,21 +434,21 @@ class MicListener(QThread):
                             try:
                                 q = recognizer.recognize_google(audio2, language="en-US").strip()
                                 if q.lower() == "q":
-                                    self.append.emit("Goodbye!")
+                                    print("Goodbye!", flush=True)
                                     self.exit_signal.emit()
                                     return
                                 if q:
                                     self.query.emit(q)
                             except sr.UnknownValueError:
-                                self.append.emit("Didn't catch that—try again with 'GPT, …'")
+                                print("Didn't catch that—try again with 'GPT, …'", flush=True)
                             except sr.RequestError as e:
-                                self.append.emit(f"ASR error: {e}")
+                                print(f"ASR error: {e}", flush=True)
                         except sr.WaitTimeoutError:
-                            self.append.emit("Timed out—say 'GPT, …' again.")
+                            print("Timed out—say 'GPT, …' again.", flush=True)
             except sr.WaitTimeoutError:
                 continue
             except Exception as e:
-                self.append.emit(f"Mic error: {e}")
+                print(f"Mic error: {e}", flush=True)
                 continue
 
 # ========= Main Window (Alexa screen styling) =========
@@ -484,14 +483,9 @@ class AskZacWindow(QMainWindow):
         root.setContentsMargins(40, 30, 40, 24)
         root.setSpacing(12)
 
-        top = QHBoxLayout()
-        self.title = QLabel("AskZac", self); self.title.setObjectName("title")
-        self.title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        top.addWidget(self.title, 1)
-
+        # --- centered clock (replaces previous top HBox with title/clock) ---
         self.clock = ClockWidget(self)
-        top.addWidget(self.clock, 0, Qt.AlignRight)
-        root.addLayout(top)
+        root.addWidget(self.clock, 0, Qt.AlignHCenter)
 
         self.statusLabel = QLabel("Idle", self); self.statusLabel.setObjectName("status")
         root.addWidget(self.statusLabel, 0, Qt.AlignLeft)
@@ -500,10 +494,8 @@ class AskZacWindow(QMainWindow):
         self.textArea.setLineWrapMode(QTextEdit.WidgetWidth)
         self.textArea.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.textArea.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.textArea.setAlignment(Qt.AlignHCenter)  # center text horizontally like Echo Show
+        self.textArea.setAlignment(Qt.AlignHCenter)
         root.addWidget(self.textArea, 1)
-
-        # Removed the manual send/typing row to match Alexa-style voice-first UI
 
         self.wakeBar = WakeBar(self, height=18)
         root.addWidget(self.wakeBar)
@@ -554,7 +546,6 @@ class AskZacWindow(QMainWindow):
         self.statusLabel.setText(status)
 
     def toggle_listening(self):
-        # Kept for completeness; safe if called elsewhere
         self.listening_enabled = not self.listening_enabled
         self.listener.listening_enabled = self.listening_enabled
         self.set_status("Listening" if self.listening_enabled else "Paused")
@@ -576,8 +567,8 @@ class AskZacWindow(QMainWindow):
 
     # ----- Core logic (ALWAYS phrased via GPT) -----
     def ask_and_speak(self, query: str):
-        self.append(f"You: {query}")
-        self.append("Thinking...")
+        print(f"You: {query}", flush=True)
+        print("Thinking...", flush=True)
         self.set_status("Thinking")
 
         def worker():
@@ -605,11 +596,11 @@ class AskZacWindow(QMainWindow):
                     speak_openai(phrased, on_done=lambda: self._resume_after_tts())
                     return
                 except Exception as e:
-                    self.append(f"Weather fetch failed: {e}. Checking the web…")
+                    print(f"Weather fetch failed: {e}. Checking the web…", flush=True)
 
             # Web search synth (never raw)
             if answer == UNCERTAIN_TOKEN:
-                self.append("Checking the web…")
+                print("Checking the web…", flush=True)
                 results = web_search_structured(query, n=SEARCH_RESULTS_N)
                 synth = ask_openai_from_search(query, results)
                 if synth == UNCERTAIN_TOKEN:
