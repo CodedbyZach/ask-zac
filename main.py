@@ -18,10 +18,10 @@ from dotenv import load_dotenv
 import requests
 
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QTime, QDate
-from PyQt5.QtGui import QPainter, QLinearGradient, QColor, QFont
+from PyQt5.QtGui import QPainter, QLinearGradient, QColor, QFont, QPainterPath, QRadialGradient, QPen
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel,
-    QTextEdit, QLineEdit, QHBoxLayout, QPushButton, QSizePolicy
+    QTextEdit, QHBoxLayout
 )
 
 # ================== Config ==================
@@ -283,11 +283,11 @@ def looks_like_weather(q: str) -> bool:
 
 # ========= Alexa-style bottom wake bar =========
 class WakeBar(QWidget):
-    def __init__(self, parent=None, height=14):
+    def __init__(self, parent=None, height=18):
         super().__init__(parent)
         self.setFixedHeight(height)
         self._active = False
-        self._phase = 0.0
+        self._t = 0.0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self.hide()
@@ -295,8 +295,8 @@ class WakeBar(QWidget):
     def showActive(self, active: bool):
         self._active = active
         if active:
-            self._phase = 0.0
-            self._timer.start(30)
+            self._t = 0.0
+            self._timer.start(16)  # smoother animation (~60fps)
             self.show()
         else:
             self._timer.stop()
@@ -304,20 +304,53 @@ class WakeBar(QWidget):
         self.update()
 
     def _tick(self):
-        self._phase = (self._phase + 0.12) % (2*math.pi)
+        self._t += 0.035
         self.update()
 
     def paintEvent(self, event):
-        if not self._active: return
+        if not self._active:
+            return
         w, h = self.width(), self.height()
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
-        alpha = int(80 + (math.sin(self._phase) + 1) * 0.5 * 160)
+
+        # --- Alexa-like undulating top edge ---
+        path = QPainterPath()
+        amp = max(2.0, h * 0.35)                      # small ripple
+        freq = 2.0                                    # ~2 waves across
+        phase = self._t * 2.2
+        path.moveTo(0, h)
+        x = 0
+        step = max(4, int(w / 120))
+        while x <= w:
+            y_top = h - 1 - amp * (0.5 + 0.5 * math.sin((x / max(1, w)) * math.tau * freq + phase))
+            path.lineTo(x, y_top)
+            x += step
+        path.lineTo(w, h)
+        path.closeSubpath()
+
+        # --- Core cyan/royal gradient (Alexa vibe) ---
+        pulse = 0.6 + 0.4 * math.sin(self._t * 2.0)
+        base_alpha = int(150 + 70 * pulse)
         grad = QLinearGradient(0, 0, w, 0)
-        grad.setColorAt(0.0, QColor(0, 170, 255, alpha))
-        grad.setColorAt(0.5, QColor(0, 210, 255, min(255, alpha+25)))
-        grad.setColorAt(1.0, QColor(0, 150, 255, alpha))
-        p.fillRect(0, 0, w, h, grad)
+        grad.setColorAt(0.00, QColor(26, 116, 240, base_alpha))   # royal blue
+        grad.setColorAt(0.50, QColor(0, 201, 255, min(255, base_alpha + 25)))  # cyan
+        grad.setColorAt(1.00, QColor(26, 116, 240, base_alpha))
+        p.fillPath(path, grad)
+
+        # --- Traveling "comet" highlight ---
+        cx = (0.5 * (math.sin(self._t * 1.4) + 1.0)) * w
+        comet = QRadialGradient(cx, h * 0.55, h * 1.8)
+        comet.setColorAt(0.00, QColor(200, 255, 255, 200))
+        comet.setColorAt(0.40, QColor(0, 220, 255, 150))
+        comet.setColorAt(1.00, QColor(0, 220, 255, 0))
+        p.setBrush(comet)
+        p.setPen(Qt.NoPen)
+        p.drawPath(path)
+
+        # --- Subtle top edge glow ---
+        p.setOpacity(0.9)
+        p.strokePath(path, QPen(QColor(0, 230, 255, 180), 2))
 
 # ========= Clock (Echo Show vibe) =========
 class ClockWidget(QLabel):
@@ -343,7 +376,7 @@ class MicListener(QThread):
     query = pyqtSignal(str)
     exit_signal = pyqtSignal()
     wake = pyqtSignal()       # emitted when "GPT" is detected
-    status = pyqtSignal(str)  # "listening"
+    status = pyqtSignal(str)  # e.g., "Listening"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -356,9 +389,12 @@ class MicListener(QThread):
     def run(self):
         while self._running:
             if not self.listening_enabled:
-                self.msleep(50); continue
+                self.msleep(50)
+                continue
+
             self.status.emit("Listening")
             self.append.emit("Listening… (say: 'GPT, hello')")
+
             try:
                 with mic as source:
                     recognizer.adjust_for_ambient_noise(source, duration=0.2)
@@ -377,7 +413,9 @@ class MicListener(QThread):
                     continue
 
                 if heard.strip().lower() == "q":
-                    self.append.emit("Goodbye!"); self.exit_signal.emit(); return
+                    self.append.emit("Goodbye!")
+                    self.exit_signal.emit()
+                    return
 
                 if contains_wake(heard):
                     self.wake.emit()  # <-- show the blue bar
@@ -397,7 +435,9 @@ class MicListener(QThread):
                             try:
                                 q = recognizer.recognize_google(audio2, language="en-US").strip()
                                 if q.lower() == "q":
-                                    self.append.emit("Goodbye!"); self.exit_signal.emit(); return
+                                    self.append.emit("Goodbye!")
+                                    self.exit_signal.emit()
+                                    return
                                 if q:
                                     self.query.emit(q)
                             except sr.UnknownValueError:
@@ -424,33 +464,19 @@ class AskZacWindow(QMainWindow):
             QMainWindow { background: qlineargradient(x1:0,y1:0, x2:0,y2:1,
                                 stop:0 #0a1026, stop:0.6 #0d1a3a, stop:1 #0b1631); }
             QLabel#title {
-                color: #e8f2ff; font-size: 38px; font-weight: 700; letter-spacing: 0.6px;
+                color: #e8f2ff; font-size: 44px; font-weight: 700; letter-spacing: 0.6px;
             }
             QLabel#status {
-                color: #9fd7ff; font-size: 18px; font-weight: 500;
+                color: #9fd7ff; font-size: 20px; font-weight: 500;
             }
             QTextEdit {
-                background: rgba(12, 24, 58, 0.55);
+                background: transparent;
                 color: #eef7ff;
-                border: 1px solid rgba(0,180,255,0.25);
-                border-radius: 22px;
-                padding: 14px;
+                border: none;
+                padding: 0px;
                 font-family: Segoe UI, Roboto, "Fira Sans", Arial;
-                font-size: 16px;
+                font-size: 28px;
             }
-            QLineEdit {
-                background: rgba(10, 22, 48, 0.75);
-                color: #e9f3ff;
-                border: 1px solid rgba(0,180,255,0.35);
-                border-radius: 22px;
-                padding: 12px 16px; font-size: 16px;
-            }
-            QPushButton#micBtn {
-                background: rgba(10, 22, 48, 0.85); color: #bfeaff;
-                border: 1px solid rgba(0,180,255,0.35);
-                border-radius: 18px; padding: 8px 16px; font-weight: 600;
-            }
-            QPushButton#micBtn:hover { border-color: rgba(0,220,255,0.8); color: white; }
         """)
 
         central = QWidget(self)
@@ -472,20 +498,14 @@ class AskZacWindow(QMainWindow):
 
         self.textArea = QTextEdit(self); self.textArea.setReadOnly(True)
         self.textArea.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.textArea.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.textArea.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.textArea.setAlignment(Qt.AlignHCenter)  # center text horizontally like Echo Show
         root.addWidget(self.textArea, 1)
 
-        inputRow = QHBoxLayout()
-        self.entry = QLineEdit(self)
-        self.entry.setPlaceholderText("Say “GPT, …” or type here. Type q to quit.")
-        self.entry.returnPressed.connect(self.on_enter)
-        inputRow.addWidget(self.entry, 1)
+        # Removed the manual send/typing row to match Alexa-style voice-first UI
 
-        self.micBtn = QPushButton("Listening ON", self); self.micBtn.setObjectName("micBtn")
-        self.micBtn.clicked.connect(self.toggle_listening)
-        inputRow.addWidget(self.micBtn, 0, Qt.AlignRight)
-        root.addLayout(inputRow)
-
-        self.wakeBar = WakeBar(self, height=14)
+        self.wakeBar = WakeBar(self, height=18)
         root.addWidget(self.wakeBar)
 
         self.setCentralWidget(central)
@@ -499,7 +519,7 @@ class AskZacWindow(QMainWindow):
         self.listener.status.connect(lambda s: self.set_status(s))
 
         self.listening_enabled = True
-        self.append("AskZac: Say 'GPT, <your message>' or type. ('q' to quit)")
+        self.append("Say “GPT, …”")
         self.set_status("Idle")
         quick_calibrate(0.6)
         self.listener.start()
@@ -534,35 +554,25 @@ class AskZacWindow(QMainWindow):
         self.statusLabel.setText(status)
 
     def toggle_listening(self):
+        # Kept for completeness; safe if called elsewhere
         self.listening_enabled = not self.listening_enabled
         self.listener.listening_enabled = self.listening_enabled
-        self.micBtn.setText("Listening ON" if self.listening_enabled else "Listening OFF")
         self.set_status("Listening" if self.listening_enabled else "Paused")
 
     def pause_listening(self):
         self.listening_enabled = False
         self.listener.listening_enabled = False
-        self.micBtn.setText("Listening OFF")
         self.set_status("Paused")
 
     def resume_listening(self):
         self.listening_enabled = True
         self.listener.listening_enabled = True
-        self.micBtn.setText("Listening ON")
         self.set_status("Listening")
 
     # ----- Wake bar control -----
     def onWake(self):
         self.wakeBar.showActive(True)
         QTimer.singleShot(WAKE_BAR_MS, lambda: self.wakeBar.showActive(False))
-
-    # ----- Input handling -----
-    def on_enter(self):
-        txt = self.entry.text().strip(); self.entry.clear()
-        if txt.lower() == "q":
-            self.close(); return
-        if txt:
-            self.ask_and_speak(txt)
 
     # ----- Core logic (ALWAYS phrased via GPT) -----
     def ask_and_speak(self, query: str):
@@ -603,7 +613,6 @@ class AskZacWindow(QMainWindow):
                 results = web_search_structured(query, n=SEARCH_RESULTS_N)
                 synth = ask_openai_from_search(query, results)
                 if synth == UNCERTAIN_TOKEN:
-                    # Build minimal context and have GPT rephrase it
                     if results:
                         blob = f"{results[0].get('title','')}: {results[0].get('snippet','')}"
                     else:
