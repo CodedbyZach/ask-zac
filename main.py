@@ -530,6 +530,7 @@ class AskZacWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self.setWindowFlags(Qt.FramelessWindowHint)
         self.setWindowTitle("AskZac")
         # Alexa-like deep blue gradient background
         self.setStyleSheet("""
@@ -637,7 +638,7 @@ class AskZacWindow(QMainWindow):
 
         def speak_and_fade(text_to_say: str):
             # while speaking, fade the orange bar smoothly to transparent
-            self.wakeBar.setMode('speaking')
+            self.wakeBar.setMode('off')
             self.pause_listening()
             self.set_status("Speaking")
             speak_openai(text_to_say, on_done=lambda: self._resume_after_tts())
