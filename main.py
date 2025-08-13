@@ -310,15 +310,13 @@ class WakeBar(QWidget):
 
         self._mode = mode
         if mode == 'listen':
-            self._orange_mix = 0.0
+            self._orange_mix = 0.0      # solid blue
             self._fade = 0.0
         elif mode == 'think':
-            # start from blue and crossfade to orange
+            self._orange_mix = 0.0      # start at blue, cross-fade to orange
             self._fade = 0.0
-            # keep whatever current mix is (if coming from listen it's 0.0)
         elif mode == 'speaking':
-            # force orange, then fade alpha to 0 while keeping animation running
-            self._orange_mix = 1.0
+            self._orange_mix = 1.0      # orange, then fade out
             self._fade = 0.0
 
         self.showActive(True)
@@ -338,14 +336,17 @@ class WakeBar(QWidget):
         self._t += 0.035
 
         if self._mode == 'think':
-            # crossfade to orange over ~0.6–0.8s
+            # smooth cross-fade blue -> orange (~0.6–0.8s)
             self._orange_mix = min(1.0, self._orange_mix + 0.05)
             self._fade = 0.0
         elif self._mode == 'speaking':
-            # smoothly fade to transparent over ~0.8s (but keep animating)
+            # fade orange to transparent (~0.8s)
             self._fade = min(1.0, self._fade + 0.04)
+            if self._fade >= 1.0:
+                # fully transparent → disappear (prevents "freeze")
+                self.setMode('off')
+                return
 
-        # keep animating even when fully transparent to avoid the "freeze" look
         self.update()
 
     def _mix(self, a: int, b: int, t: float) -> int:
