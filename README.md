@@ -1,7 +1,5 @@
 # AskZac
 
-Personal AI assistant.
-
 ## Prerequisites
 - Python 3.10+ (`python --version` or `python3 --version`)
 - Git
