@@ -32,10 +32,8 @@ WAKE_PHRASE_MAXS = 5.0
 QUESTION_TIMEOUT = 10.0
 QUESTION_MAXS    = 14.0
 UNCERTAIN_TOKEN  = "<i-dont-know>"
-USER_ZIP         = "14580"  # Webster, NY
 TZ               = "America/New_York"
 SEARCH_RESULTS_N = 3
-SECOND_MONITOR_INDEX = 1      # 0=primary, 1=second
 FULLSCREEN_ON_SECOND = True   # Alexa-style: full-screen
 # ===========================================
 
@@ -43,6 +41,10 @@ FULLSCREEN_ON_SECOND = True   # Alexa-style: full-screen
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+USER_ZIP = os.getenv("USER_ZIP", "90210").split('#')[0].strip()
+SECOND_MONITOR_INDEX = int(os.getenv("MONITOR_NUMBER", "0").split('#')[0].strip())
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5").split('#')[0].strip()
+TTS_MODEL = os.getenv("TTS_MODEL", "tts-1").split('#')[0].strip()
 openai.api_key = OPENAI_API_KEY
 
 # ====== Speech Recog ======
@@ -176,17 +178,17 @@ def fetch_weather_zip(zip_code, tz=TZ):
 def ask_openai(prompt):
     try:
         resp = openai.chat.completions.create(
-            model="gpt-4o",
-            temperature=0,
-            messages=[
-                {
-                    "role":"system",
-                    "content": f"You are a careful assistant. If unsure or lacking fresh web info, reply EXACTLY with {UNCERTAIN_TOKEN}."
-                },
-                {"role":"user","content":prompt}
-            ],
-            max_tokens=300,
-        )
+        model=OPENAI_MODEL,
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": f"You are a careful assistant. If unsure or lacking fresh web info, reply EXACTLY with {UNCERTAIN_TOKEN}. Keep your answers to no more than two sentences unless more is absolutely necessary."
+            },
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=300,
+    )
         text = (resp.choices[0].message.content or "").strip()
         if text.lower() in {UNCERTAIN_TOKEN, "<i dont know>", "<i_dont_know>", "<idontknow>"}:
             return UNCERTAIN_TOKEN
@@ -199,7 +201,7 @@ def ask_openai_style_weather(summary_dict):
     try:
         msg = json.dumps(summary_dict)
         resp = openai.chat_completions.create(  # keep as-is per your current code
-            model="gpt-4o",
+            model=OPENAI_MODEL,
             temperature=0.2,
             messages=[
                 {"role":"system","content":
@@ -222,7 +224,7 @@ def ask_openai_from_search(query, results):
     try:
         payload = {"query": query, "results": results}
         resp = openai.chat.completions.create(
-            model="gpt-4o",
+            model=OPENAI_MODEL,
             temperature=0.2,
             messages=[
                 {"role":"system","content":
@@ -243,7 +245,7 @@ def refine_text_with_openai(query, context_text):
     """Last-resort phrasing pass so we NEVER speak raw data."""
     try:
         resp = openai.chat.completions.create(
-            model="gpt-4o",
+            model=OPENAI_MODEL,
             temperature=0.3,
             messages=[
                 {"role":"system","content":
@@ -262,7 +264,7 @@ def speak_openai(text, on_done, voice="alloy"):
     def tts_thread():
         try:
             spoken = text.strip() if text and text.strip() else "Sorry, I don't know."
-            resp = openai.audio.speech.create(model="tts-1", voice=voice, input=spoken)
+            resp = openai.audio.speech.create(model=TTS_MODEL, voice=voice, input=spoken)
             with open("output.wav", "wb") as f:
                 f.write(resp.content)
             subprocess.run(['ffplay','-nodisp','-autoexit','-loglevel','quiet','output.wav'],
