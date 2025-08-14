@@ -30,25 +30,26 @@ pip install -r requirements.txt
 ```
 
 ## 4) Create and edit `.env`
-AskZac env needs:
-- `OPENAI_API_KEY`
-- `SERPAPI_API_KEY`
 
 **Windows (PowerShell):**
-```powershell
-@"
-OPENAI_API_KEY=your_openai_key_here
-SERPAPI_API_KEY=your_serpapi_key_here
-"@ | Out-File -Encoding ascii .env
-```
+
+Please open .env with your desired text editor and change the:
+- Web Search API Key
+- OpenAI API Key
+- Zip Code
+- And monitor number
 
 **macOS / Linux:**
 ```bash
-cat > .env << 'EOF'
-OPENAI_API_KEY=your_openai_key_here
-SERPAPI_API_KEY=your_serpapi_key_here
-EOF
+nano .env
 ```
+Please change the:
+- Web Search API Key
+- OpenAI API Key
+- Zip Code
+- And monitor number
+
+When you're done, press Ctrl + O, enter, to save, then ctrl X to exit
 
 ## 5) Run the app
 ```bash
