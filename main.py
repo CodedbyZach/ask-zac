@@ -5,23 +5,15 @@
 # Blue while user is speaking, fades into orange while thinking,
 # and smoothly fades to transparent while speaking.
 
-import sys, os, re, difflib, time, threading, subprocess, json, math
-sys.stderr = open(os.devnull, 'w')
-os.environ["JACK_NO_MSG"] = "1"
-os.environ["SDL_JACK_NO_MSG"] = "1"
-os.environ["ALSA_LOGLEVEL"] = "none"
-os.environ["ALSA_DEBUG"] = "0"
-
-import openai
+import os, sys, re, difflib, threading, subprocess, json, math, requests, openai, tempfile, urllib.request
 import speech_recognition as sr
 from dotenv import load_dotenv
-import requests
-
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QTime, QDate
+from requests.exceptions import ChunkedEncodingError, ConnectionError
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QTime, QDate
 from PyQt5.QtGui import QPainter, QLinearGradient, QColor, QFont, QPainterPath, QRadialGradient, QPen
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel,
-    QTextEdit, QHBoxLayout
+    QTextEdit
 )
 
 # ================== Config ==================
@@ -34,7 +26,7 @@ QUESTION_MAXS    = 14.0
 UNCERTAIN_TOKEN  = "<i-dont-know>"
 TZ               = "America/New_York"
 SEARCH_RESULTS_N = 3
-FULLSCREEN_ON_SECOND = True   # Alexa-style: full-screen
+FULLSCREEN_ON_SECOND = True
 # ===========================================
 
 # ====== Env / API ======
@@ -42,6 +34,7 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 USER_ZIP = os.getenv("USER_ZIP", "90210").split('#')[0].strip()
+TIMER_RING_SOUND = os.getenv("TIMER_RING_SOUND", "timer_done.wav").split('#')[0].strip()
 SECOND_MONITOR_INDEX = int(os.getenv("MONITOR_NUMBER", "0").split('#')[0].strip())
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5").split('#')[0].strip()
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1").split('#')[0].strip()
@@ -157,8 +150,16 @@ def fetch_weather_zip(zip_code, tz=TZ):
         "windspeed_unit": "mph",
         "precipitation_unit": "inch",
     }
-    r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=15)
-    r.raise_for_status()
+
+    url = "https://api.open-meteo.com/v1/forecast"
+    try:
+        r = requests.get(url, params=params, timeout=(15, 15))
+        r.raise_for_status()
+    except (ChunkedEncodingError, ConnectionError):
+        # retry once
+        r = requests.get(url, params=params, timeout=(15, 15))
+        r.raise_for_status()
+
     d = r.json().get("daily", {})
     return {
         "place": place,
@@ -183,7 +184,7 @@ def ask_openai(prompt):
         messages=[
             {
                 "role": "system",
-                "content": f"You are a careful assistant. If unsure or lacking fresh web info, reply EXACTLY with {UNCERTAIN_TOKEN}. Keep your answers to no more than two sentences unless more is absolutely necessary."
+                "content": f"You are a careful assistant. If unsure, lacking fresh web info, or the user asks about the weather, reply EXACTLY with {UNCERTAIN_TOKEN}. Keep your answers to no more than two sentences unless more is absolutely necessary."
             },
             {"role": "user", "content": prompt}
         ],
@@ -281,6 +282,89 @@ def looks_like_weather(q: str) -> bool:
         "weather","forecast","temperature","rain","snow","wind","sunrise","sunset"
     ])
 
+# ====== Timer logic ======
+def start_timer(seconds, auto_dismiss=True):
+    """Starts a timer and plays a sound when done."""
+    def start_on_main():
+        win._timer_seconds_left = seconds
+        win._update_timer_label()
+        win.timerLabel.raise_()
+        win._timer_qtimer.start(1000)
+    QTimer.singleShot(0, start_on_main)
+
+    def timer_thread():
+        threading.Event().wait(seconds)
+        try:
+            sound_source = TIMER_RING_SOUND
+            if sound_source.startswith("http://") or sound_source.startswith("https://"):
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(sound_source)[1])
+                urllib.request.urlretrieve(sound_source, tmp_file.name)
+                sound_source = tmp_file.name
+
+            subprocess.run(
+                ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', sound_source],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception as e:
+            print(f"[Timer sound error] {e}")
+
+        if auto_dismiss:
+            QTimer.singleShot(0, lambda: (
+                win.append(""),
+                win.set_status("Idle"),
+                win.wakeBar.setMode('off'),
+                win.timerLabel.setText(""),
+                win._timer_qtimer.stop()
+            ))
+
+    threading.Thread(target=timer_thread, daemon=True).start()
+
+def format_duration_human(seconds):
+    parts = []
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        parts.append(f"{h} hour" + ("s" if h != 1 else ""))
+    if m > 0:
+        parts.append(f"{m} minute" + ("s" if m != 1 else ""))
+    if s > 0 or not parts:  # always show seconds if nothing else
+        parts.append(f"{s} second" + ("s" if s != 1 else ""))
+    return ", ".join(parts)
+
+# ====== Ask OpenAI with timer detection ======
+def ask_openai_with_timer_detection(prompt):
+    try:
+        resp = openai.chat.completions.create(
+            model=OPENAI_MODEL,
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a careful assistant. "
+                        "If the user requests a timer, respond ONLY with a JSON object "
+                        "like {\"timer_seconds\": <number>} and nothing else. "
+                        "If not a timer, answer normally in 1–2 sentences."
+                    )
+                },
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=100
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        print(f"[DEBUG] GPT raw output: {text}")
+        # Check if it's JSON with timer info
+        if text.startswith("{") and "timer_seconds" in text:
+            try:
+                data = json.loads(text)
+                return {"_timer_seconds": int(data["timer_seconds"])}
+            except Exception:
+                pass
+        return {"_answer": text}
+    except Exception:
+        return {"_answer": UNCERTAIN_TOKEN}
+
 # ========= State-aware Wake Bar =========
 class WakeBar(QWidget):
     """Modes:
@@ -299,6 +383,7 @@ class WakeBar(QWidget):
         self._fade = 0.0        # 0=opaque, 1=transparent
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
+        self._timer_seconds_left = 0
         self.hide()
 
     def setMode(self, mode: str):
@@ -426,6 +511,15 @@ class WakeBar(QWidget):
         p.setOpacity(0.9 * (1.0 - self._fade))
         p.strokePath(path, QPen(self._mixColor(QColor(0,230,255,180), QColor(255,190,90,180), tcol, 180), 2))
 
+        if self._timer_seconds_left > 0:
+            p.setPen(Qt.red)
+            p.setFont(QFont("Arial", 32))
+            hrs = self._timer_seconds_left // 3600
+            mins = (self._timer_seconds_left % 3600) // 60
+            secs = self._timer_seconds_left % 60
+            text = f"{hrs:02}:{mins:02}:{secs:02}"
+            p.drawText(self.width() - 150, 40, text)
+
 # ========= Clock (Echo Show vibe) =========
 class ClockWidget(QLabel):
     def __init__(self, parent=None):
@@ -530,6 +624,28 @@ class MicListener(QThread):
 class AskZacWindow(QMainWindow):
     appendSignal = pyqtSignal(str)
 
+    def _update_timer_label(self):
+        if self._timer_seconds_left > 0:
+            hrs = self._timer_seconds_left // 3600
+            mins = (self._timer_seconds_left % 3600) // 60
+            secs = self._timer_seconds_left % 60
+            self.timerLabel.setText(f"{hrs:02}:{mins:02}:{secs:02}")
+            self.timerLabel.adjustSize()
+            cw = self.centralWidget()
+            self.timerLabel.move(cw.width() - self.timerLabel.width() - 20, 10)
+            self.timerLabel.show()
+            self.timerLabel.raise_()
+            self._timer_seconds_left -= 1
+        else:
+            self.timerLabel.setText("")
+            self.timerLabel.hide()
+            self._timer_qtimer.stop()
+
+    def resizeEvent(self, event):
+        cw = self.centralWidget()
+        self.timerLabel.move(cw.width() - self.timerLabel.width() - 20, 10)
+        super(AskZacWindow, self).resizeEvent(event)
+
     def __init__(self):
         super().__init__()
         self.setWindowFlags(Qt.FramelessWindowHint)
@@ -559,9 +675,22 @@ class AskZacWindow(QMainWindow):
         root.setContentsMargins(40, 30, 40, 24)
         root.setSpacing(12)
 
-        # centered clock
+        # Centered clock
         self.clock = ClockWidget(self)
         root.addWidget(self.clock, 0, Qt.AlignHCenter)
+
+        # Timer label (top-right)
+        self.timerLabel = QLabel("", self.centralWidget())
+        self.timerLabel.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.timerLabel.hide()
+        self.timerLabel.setStyleSheet("color:#ffcc66; font-size: 20px; font-weight: 500;")
+        self.timerLabel.setFixedHeight(28)  # optional
+        self.timerLabel.move(self.width() - 120, 10)  # initial position near top right
+        self.timerLabel.raise_()
+
+        self._timer_seconds_left = 0
+        self._timer_qtimer = QTimer(self)
+        self._timer_qtimer.timeout.connect(self._update_timer_label)
 
         self.statusLabel = QLabel("Idle", self); self.statusLabel.setObjectName("status")
         root.addWidget(self.statusLabel, 0, Qt.AlignLeft)
@@ -646,6 +775,18 @@ class AskZacWindow(QMainWindow):
             speak_openai(text_to_say, on_done=lambda: self._resume_after_tts())
 
         def worker():
+            parsed = ask_openai_with_timer_detection(query)
+            if "_timer_seconds" in parsed:
+                secs = parsed["_timer_seconds"]
+                human_time = format_duration_human(secs)
+                text_to_speak = f"Timer set for {human_time}."
+                self.append(text_to_speak)
+                speak_openai(text_to_speak, on_done=lambda: None)
+                self.wakeBar.setMode('off')
+                self.set_status("Idle")
+                start_timer(secs, auto_dismiss=True)
+                return
+            
             answer = ask_openai(query)
 
             # Weather-smart path (always phrased)
