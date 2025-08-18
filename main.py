@@ -285,6 +285,7 @@ def looks_like_weather(q: str) -> bool:
 # ====== Timer logic ======
 def start_timer(seconds, auto_dismiss=True):
     """Starts a timer and plays a sound when done."""
+
     def start_on_main():
         win._timer_seconds_left = seconds
         win._update_timer_label()
@@ -296,7 +297,7 @@ def start_timer(seconds, auto_dismiss=True):
         threading.Event().wait(seconds)
         try:
             sound_source = TIMER_RING_SOUND
-            if sound_source.startswith("http://") or sound_source.startswith("https://"):
+            if sound_source.startswith(("http://", "https://")):
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(sound_source)[1])
                 urllib.request.urlretrieve(sound_source, tmp_file.name)
                 sound_source = tmp_file.name
@@ -309,13 +310,15 @@ def start_timer(seconds, auto_dismiss=True):
             print(f"[Timer sound error] {e}")
 
         if auto_dismiss:
-            QTimer.singleShot(0, lambda: (
-                win.append(""),
-                win.set_status("Idle"),
-                win.wakeBar.setMode('off'),
-                win.timerLabel.setText(""),
+            # schedule UI + timer stop safely on main thread
+            def dismiss_on_main():
+                win.append("")
+                win.set_status("Idle")
+                win.wakeBar.setMode('off')
+                win.timerLabel.setText("")
                 win._timer_qtimer.stop()
-            ))
+
+            QTimer.singleShot(0, dismiss_on_main)
 
     threading.Thread(target=timer_thread, daemon=True).start()
 
@@ -338,14 +341,16 @@ def ask_openai_with_timer_detection(prompt):
         resp = openai.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0,
+            response_format={"type": "json_object"},  # 👈 forces JSON output
             messages=[
                 {
                     "role": "system",
                     "content": (
                         "You are a careful assistant. "
-                        "If the user requests a timer, respond ONLY with a JSON object "
-                        "like {\"timer_seconds\": <number>} and nothing else. "
-                        "If not a timer, answer normally in 1–2 sentences."
+                        "If the user requests a timer, respond ONLY as a JSON object "
+                        "with this exact format: {\"timer_seconds\": <number>}. "
+                        "If no timer is requested, respond as "
+                        "{\"timer_seconds\": null, \"answer\": \"<short reply>\"}."
                     )
                 },
                 {"role": "user", "content": prompt}
@@ -354,15 +359,15 @@ def ask_openai_with_timer_detection(prompt):
         )
         text = (resp.choices[0].message.content or "").strip()
         print(f"[DEBUG] GPT raw output: {text}")
-        # Check if it's JSON with timer info
-        if text.startswith("{") and "timer_seconds" in text:
-            try:
-                data = json.loads(text)
-                return {"_timer_seconds": int(data["timer_seconds"])}
-            except Exception:
-                pass
-        return {"_answer": text}
-    except Exception:
+
+        # Parse guaranteed JSON
+        data = json.loads(text)
+        if data.get("timer_seconds") is not None:
+            return {"_timer_seconds": int(data["timer_seconds"])}
+        return {"_answer": data.get("answer", "")}
+
+    except Exception as e:
+        print(f"[ERROR] Timer detection failed: {e}")
         return {"_answer": UNCERTAIN_TOKEN}
 
 # ========= State-aware Wake Bar =========
@@ -768,10 +773,9 @@ class AskZacWindow(QMainWindow):
         self.wakeBar.setMode('think')
 
         def speak_and_fade(text_to_say: str):
-            # while speaking, fade the orange bar smoothly to transparent
-            self.wakeBar.setMode('off')
+            QTimer.singleShot(0, lambda: self.wakeBar.setMode('off'))
             self.pause_listening()
-            self.set_status("Speaking")
+            QTimer.singleShot(0, lambda: self.set_status("Speaking"))
             speak_openai(text_to_say, on_done=lambda: self._resume_after_tts())
 
         def worker():
@@ -782,8 +786,8 @@ class AskZacWindow(QMainWindow):
                 text_to_speak = f"Timer set for {human_time}."
                 self.append(text_to_speak)
                 speak_openai(text_to_speak, on_done=lambda: None)
-                self.wakeBar.setMode('off')
-                self.set_status("Idle")
+                QTimer.singleShot(0, lambda: self.wakeBar.setMode('off'))
+                QTimer.singleShot(0, lambda: self.set_status("Idle"))   # ✅ fixed
                 start_timer(secs, auto_dismiss=True)
                 return
             
@@ -845,9 +849,8 @@ class AskZacWindow(QMainWindow):
 
     def _resume_after_tts(self):
         self.resume_listening()
-        self.set_status("Listening")
-        # after speaking completes, hide the (now-transparent) bar
-        self.wakeBar.setMode('off')
+        QTimer.singleShot(0, lambda: self.set_status("Listening"))
+        QTimer.singleShot(0, lambda: self.wakeBar.setMode('off'))
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape and self.isFullScreen():
