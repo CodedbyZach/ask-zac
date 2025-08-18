@@ -59,9 +59,8 @@ def quick_calibrate(seconds=0.6):
 
 # -------- Wake word helpers ----------
 COMMON_EQUIVS = {
-    r"\bgee\b": "g", r"\bje\b": "g", r"\bjee\b": "g",
-    r"\bpea\b": "p", r"\bpee\b": "p",
-    r"\btea\b": "t", r"\btee\b": "t",
+    r"(?i)\b[dDbBpP]\s*P\s*T\b": "gpt",  # DPT, BPT, PPT → GPT
+    r"(?i)\b[gG]\s*P\s*T\b": "gpt",      # GPT (normalized case-insensitive)
 }
 WAKE_PAT = re.compile(r"\b(g\.?\s*p\.?\s*t)\b", re.I)
 
@@ -408,8 +407,11 @@ class WakeBar(QWidget):
             self._orange_mix = 0.0      # start at blue, cross-fade to orange
             self._fade = 0.0
         elif mode == 'speaking':
-            self._orange_mix = 1.0      # orange, then fade out
-            self._fade = 0.0
+            # Only trigger fade once
+            if self._mode != 'speaking':
+                self._mode = 'speaking'
+                self._fade = 0.0
+            # 🚫 do not reset self._orange_mix here
 
         self.showActive(True)
 
@@ -773,10 +775,11 @@ class AskZacWindow(QMainWindow):
         self.wakeBar.setMode('think')
 
         def speak_and_fade(text_to_say: str):
-            QTimer.singleShot(0, lambda: self.wakeBar.setMode('off'))
             self.pause_listening()
+            QTimer.singleShot(0, lambda: self.wakeBar.setMode('speaking'))  # 👈 fade out
             QTimer.singleShot(0, lambda: self.set_status("Speaking"))
             speak_openai(text_to_say, on_done=lambda: self._resume_after_tts())
+
 
         def worker():
             parsed = ask_openai_with_timer_detection(query)
