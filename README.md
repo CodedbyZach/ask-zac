@@ -53,7 +53,8 @@ When you're done, press Ctrl + O, enter, to save, then ctrl X to exit
 
 ## 5) Run the app
 ```bash
-python main.py
+chmod -x run.sh
+./run.sh
 ```
 
 ## Stop / clean up
