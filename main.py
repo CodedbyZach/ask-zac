@@ -178,17 +178,18 @@ def fetch_weather_zip(zip_code, tz=TZ):
 def ask_openai(prompt):
     try:
         resp = openai.chat.completions.create(
-        model=OPENAI_MODEL,
-        temperature=0,
-        messages=[
-            {
-                "role": "system",
-                "content": f"You are a careful assistant. If unsure, lacking fresh web info, or the user asks about the weather, reply EXACTLY with {UNCERTAIN_TOKEN}. Keep your answers to no more than two sentences unless more is absolutely necessary."
-            },
-            {"role": "user", "content": prompt}
-        ],
-        max_tokens=300,
-    )
+            model=OPENAI_MODEL,
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"You are a careful assistant. If unsure, lacking fresh web info, or the user asks about the weather, reply EXACTLY with {UNCERTAIN_TOKEN}. Keep your answers to no more than two sentences unless more is absolutely necessary."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=300,
+            timeout=15  # prevent hangs
+        )
         text = (resp.choices[0].message.content or "").strip()
         if text.lower() in {UNCERTAIN_TOKEN, "<i dont know>", "<i_dont_know>", "<idontknow>"}:
             return UNCERTAIN_TOKEN
@@ -196,11 +197,13 @@ def ask_openai(prompt):
     except Exception:
         return UNCERTAIN_TOKEN
 
+
 def ask_openai_style_weather(summary_dict):
     """Always phrase weather nicely (no raw numbers)."""
     try:
         msg = json.dumps(summary_dict)
-        resp = openai.chat_completions.create(  # keep as-is per your current code
+        # fix: use .chat.completions (not chat_completions)
+        resp = openai.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0.2,
             messages=[
@@ -208,7 +211,8 @@ def ask_openai_style_weather(summary_dict):
                  "Turn the given weather data into ONE short, natural sentence for a voice assistant. Round temperatures to the nearest whole number and say 'degrees' (no ° symbol, no F). Include the city, today's high/low, notable precip %, and brief wind in mph."},
                 {"role":"user","content":msg}
             ],
-            max_tokens=120
+            max_tokens=120,
+            timeout=15
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception:
@@ -218,6 +222,7 @@ def ask_openai_style_weather(summary_dict):
                     f"{t['popmax']}% precip ({t['precip']:.2f} in), winds up to {round(t['windmax'])} mph.")
         except Exception:
             return "Here's the local forecast."
+
 
 def ask_openai_from_search(query, results):
     """Synthesize an answer from snippets (no raw snippets to user)."""
@@ -232,7 +237,8 @@ def ask_openai_from_search(query, results):
                  "answer the user's question in a natural 1–2 sentence reply."},
                 {"role":"user","content": json.dumps(payload)}
             ],
-            max_tokens=180
+            max_tokens=180,
+            timeout=15
         )
         text = (resp.choices[0].message.content or "").strip()
         if text and text.lower() not in {UNCERTAIN_TOKEN, "<i dont know>", "<i_dont_know>", "<idontnow>"}:
@@ -240,6 +246,7 @@ def ask_openai_from_search(query, results):
         return UNCERTAIN_TOKEN
     except Exception:
         return UNCERTAIN_TOKEN
+
 
 def refine_text_with_openai(query, context_text):
     """Last-resort phrasing pass so we NEVER speak raw data."""
@@ -253,18 +260,60 @@ def refine_text_with_openai(query, context_text):
                  "Be precise and concise."},
                 {"role":"user","content": json.dumps({"query": query, "data": context_text})}
             ],
-            max_tokens=120
+            max_tokens=120,
+            timeout=15
         )
         text = (resp.choices[0].message.content or "").strip()
         return text if text else context_text
     except Exception:
         return context_text
 
+
+def ask_openai_with_timer_detection(prompt):
+    try:
+        resp = openai.chat.completions.create(
+            model=OPENAI_MODEL,
+            temperature=0,
+            response_format={"type": "json_object"},  # 👈 forces JSON output
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a careful assistant. "
+                        "If the user requests a timer, respond ONLY as a JSON object "
+                        "with this exact format: {\"timer_seconds\": <number>}. "
+                        "If no timer is requested, respond as "
+                        "{\"timer_seconds\": null, \"answer\": \"<short reply>\"}."
+                    )
+                },
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=100,
+            timeout=15
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        print(f"[DEBUG] GPT raw output: {text}")
+
+        data = json.loads(text)
+        if data.get("timer_seconds") is not None:
+            return {"_timer_seconds": int(data["timer_seconds"])}
+        return {"_answer": data.get("answer", "")}
+
+    except Exception as e:
+        print(f"[ERROR] Timer detection failed: {e}")
+        return {"_answer": UNCERTAIN_TOKEN}
+
+
 def speak_openai(text, on_done, voice="alloy"):
     def tts_thread():
         try:
             spoken = text.strip() if text and text.strip() else "Sorry, I don't know."
-            resp = openai.audio.speech.create(model=TTS_MODEL, voice=voice, input=spoken)
+            # add timeout to avoid TTS hangs
+            try:
+                resp = openai.audio.speech.create(model=TTS_MODEL, voice=voice, input=spoken, timeout=60)
+            except TypeError:
+                # for older SDKs without 'timeout' kw
+                resp = openai.audio.speech.create(model=TTS_MODEL, voice=voice, input=spoken)
             with open("output.wav", "wb") as f:
                 f.write(resp.content)
             subprocess.run(['ffplay','-nodisp','-autoexit','-loglevel','quiet','output.wav'],
@@ -334,41 +383,6 @@ def format_duration_human(seconds):
         parts.append(f"{s} second" + ("s" if s != 1 else ""))
     return ", ".join(parts)
 
-# ====== Ask OpenAI with timer detection ======
-def ask_openai_with_timer_detection(prompt):
-    try:
-        resp = openai.chat.completions.create(
-            model=OPENAI_MODEL,
-            temperature=0,
-            response_format={"type": "json_object"},  # 👈 forces JSON output
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a careful assistant. "
-                        "If the user requests a timer, respond ONLY as a JSON object "
-                        "with this exact format: {\"timer_seconds\": <number>}. "
-                        "If no timer is requested, respond as "
-                        "{\"timer_seconds\": null, \"answer\": \"<short reply>\"}."
-                    )
-                },
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=100
-        )
-        text = (resp.choices[0].message.content or "").strip()
-        print(f"[DEBUG] GPT raw output: {text}")
-
-        # Parse guaranteed JSON
-        data = json.loads(text)
-        if data.get("timer_seconds") is not None:
-            return {"_timer_seconds": int(data["timer_seconds"])}
-        return {"_answer": data.get("answer", "")}
-
-    except Exception as e:
-        print(f"[ERROR] Timer detection failed: {e}")
-        return {"_answer": UNCERTAIN_TOKEN}
-
 # ========= State-aware Wake Bar =========
 class WakeBar(QWidget):
     """Modes:
@@ -399,19 +413,18 @@ class WakeBar(QWidget):
             self.showActive(False)
             return
 
-        self._mode = mode
         if mode == 'listen':
+            self._mode = 'listen'
             self._orange_mix = 0.0      # solid blue
             self._fade = 0.0
         elif mode == 'think':
-            self._orange_mix = 0.0      # start at blue, cross-fade to orange
+            self._mode = 'think'
+            self._orange_mix = 0.0      # start at blue, cross-fade to orange in _tick
             self._fade = 0.0
         elif mode == 'speaking':
-            # Only trigger fade once
-            if self._mode != 'speaking':
-                self._mode = 'speaking'
-                self._fade = 0.0
-            # 🚫 do not reset self._orange_mix here
+            self._mode = 'speaking'
+            # keep orange; only reset fade so it fades out
+            self._fade = 0.0
 
         self.showActive(True)
 
@@ -761,25 +774,32 @@ class AskZacWindow(QMainWindow):
 
     # ----- Wake bar control -----
     def onWake(self):
-        # user just said "GPT" -> show blue bar and keep it until they stop talking
         self.wakeBar.setMode('listen')
 
     # ----- Core logic (ALWAYS phrased via GPT) -----
     def ask_and_speak(self, query: str):
         print(f"You: {query}", flush=True)
         print("Thinking...", flush=True)
+
+        # pause ASAP so MicListener doesn't overwrite "Thinking"
+        self.pause_listening()
         self.set_status("Thinking")
         self.textArea.clear()
 
-        # user stopped talking; we're about to think -> fade to orange
+        # thinking -> fade to orange
         self.wakeBar.setMode('think')
 
+        # watchdog: if still "think" after 30s, reset UI and resume
+        QTimer.singleShot(30000, lambda: (
+            self.wakeBar.setMode('off'),
+            self.set_status('Listening'),
+            self.resume_listening()
+        ) if getattr(self.wakeBar, "_mode", "off") == "think" else None)
+
         def speak_and_fade(text_to_say: str):
-            self.pause_listening()
-            QTimer.singleShot(0, lambda: self.wakeBar.setMode('speaking'))  # 👈 fade out
+            QTimer.singleShot(0, lambda: self.wakeBar.setMode('speaking'))
             QTimer.singleShot(0, lambda: self.set_status("Speaking"))
             speak_openai(text_to_say, on_done=lambda: self._resume_after_tts())
-
 
         def worker():
             parsed = ask_openai_with_timer_detection(query)
@@ -788,12 +808,12 @@ class AskZacWindow(QMainWindow):
                 human_time = format_duration_human(secs)
                 text_to_speak = f"Timer set for {human_time}."
                 self.append(text_to_speak)
-                speak_openai(text_to_speak, on_done=lambda: None)
+                speak_openai(text_to_speak, on_done=lambda: self._resume_after_tts())
                 QTimer.singleShot(0, lambda: self.wakeBar.setMode('off'))
-                QTimer.singleShot(0, lambda: self.set_status("Idle"))   # ✅ fixed
+                QTimer.singleShot(0, lambda: self.set_status("Idle"))
                 start_timer(secs, auto_dismiss=True)
                 return
-            
+
             answer = ask_openai(query)
 
             # Weather-smart path (always phrased)
@@ -836,7 +856,7 @@ class AskZacWindow(QMainWindow):
                     speak_and_fade(synth)
                 return
 
-            # Normal path (already phrased answer)
+            # Normal path
             self.append(f"AskZac: {answer}")
             speak_and_fade(answer)
 
