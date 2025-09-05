@@ -358,15 +358,12 @@ def start_timer(seconds, auto_dismiss=True):
             print(f"[Timer sound error] {e}")
 
         if auto_dismiss:
-            # schedule UI + timer stop safely on main thread
-            def dismiss_on_main():
-                win.append("")
-                win.set_status("Idle")
-                win.wakeBar.setMode('off')
-                win.timerLabel.setText("")
-                win._timer_qtimer.stop()
-
-            QTimer.singleShot(0, dismiss_on_main)
+            # UI updates via signals + singleShot for label/qtimer
+            self_ref = win  # (alias)
+            self_ref.statusSig.emit("Idle")
+            self_ref.wakeModeSig.emit('off')
+            QTimer.singleShot(0, lambda: (self_ref.timerLabel.setText(""),
+                                        self_ref._timer_qtimer.stop()))
 
     threading.Thread(target=timer_thread, daemon=True).start()
 
@@ -643,6 +640,8 @@ class MicListener(QThread):
 # ========= Main Window (Alexa screen styling) =========
 class AskZacWindow(QMainWindow):
     appendSignal = pyqtSignal(str)
+    statusSig = pyqtSignal(str)
+    wakeModeSig = pyqtSignal(str)
 
     def _update_timer_label(self):
         if self._timer_seconds_left > 0:
@@ -700,7 +699,7 @@ class AskZacWindow(QMainWindow):
         root.addWidget(self.clock, 0, Qt.AlignHCenter)
 
         # Timer label (top-right)
-        self.timerLabel = QLabel("", self.centralWidget())
+        self.timerLabel = QLabel("", central)
         self.timerLabel.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.timerLabel.hide()
         self.timerLabel.setStyleSheet("color:#ffcc66; font-size: 20px; font-weight: 500;")
@@ -727,6 +726,8 @@ class AskZacWindow(QMainWindow):
 
         self.setCentralWidget(central)
         self.appendSignal.connect(self._append)
+        self.statusSig.connect(self.set_status)
+        self.wakeModeSig.connect(self.wakeBar.setMode)
 
         self.listener = MicListener(self)
         self.listener.append.connect(self.append)
@@ -770,6 +771,8 @@ class AskZacWindow(QMainWindow):
         self.textArea.moveCursor(self.textArea.textCursor().End)
 
     def set_status(self, status: str):
+        if status == "Listening" and not self.listening_enabled:
+            return
         self.statusLabel.setText(status)
 
     # ----- Wake bar control -----
@@ -797,9 +800,9 @@ class AskZacWindow(QMainWindow):
         ) if getattr(self.wakeBar, "_mode", "off") == "think" else None)
 
         def speak_and_fade(text_to_say: str):
-            QTimer.singleShot(0, lambda: self.wakeBar.setMode('speaking'))
-            QTimer.singleShot(0, lambda: self.set_status("Speaking"))
-            speak_openai(text_to_say, on_done=lambda: self._resume_after_tts())
+            self.wakeModeSig.emit('speaking')
+            self.statusSig.emit("Speaking")
+            speak_openai(text_to_say, on_done=self._resume_after_tts)
 
         def worker():
             parsed = ask_openai_with_timer_detection(query)
@@ -871,9 +874,10 @@ class AskZacWindow(QMainWindow):
         self.listener.listening_enabled = True
 
     def _resume_after_tts(self):
-        self.resume_listening()
-        QTimer.singleShot(0, lambda: self.set_status("Listening"))
-        QTimer.singleShot(0, lambda: self.wakeBar.setMode('off'))
+        # resume flags on main thread
+        QTimer.singleShot(0, self.resume_listening)
+        self.statusSig.emit("Listening")    # UI back to Listening
+        self.wakeModeSig.emit('off')        # hide bar
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape and self.isFullScreen():
