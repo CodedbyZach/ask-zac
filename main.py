@@ -13,7 +13,7 @@ from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QTime, QDate
 from PyQt5.QtGui import QPainter, QLinearGradient, QColor, QFont, QPainterPath, QRadialGradient, QPen
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel,
-    QTextEdit
+    QTextEdit, QGraphicsDropShadowEffect  # ← added
 )
 
 # ================== Config ==================
@@ -188,7 +188,7 @@ def ask_openai(prompt):
                 {"role": "user", "content": prompt}
             ],
             max_tokens=300,
-            timeout=15  # prevent hangs
+            timeout=15
         )
         text = (resp.choices[0].message.content or "").strip()
         if text.lower() in {UNCERTAIN_TOKEN, "<i dont know>", "<i_dont_know>", "<idontknow>"}:
@@ -202,7 +202,6 @@ def ask_openai_style_weather(summary_dict):
     """Always phrase weather nicely (no raw numbers)."""
     try:
         msg = json.dumps(summary_dict)
-        # fix: use .chat.completions (not chat_completions)
         resp = openai.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0.2,
@@ -274,7 +273,7 @@ def ask_openai_with_timer_detection(prompt):
         resp = openai.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0,
-            response_format={"type": "json_object"},  # 👈 forces JSON output
+            response_format={"type": "json_object"},
             messages=[
                 {
                     "role": "system",
@@ -308,11 +307,9 @@ def speak_openai(text, on_done, voice="alloy"):
     def tts_thread():
         try:
             spoken = text.strip() if text and text.strip() else "Sorry, I don't know."
-            # add timeout to avoid TTS hangs
             try:
                 resp = openai.audio.speech.create(model=TTS_MODEL, voice=voice, input=spoken, timeout=60)
             except TypeError:
-                # for older SDKs without 'timeout' kw
                 resp = openai.audio.speech.create(model=TTS_MODEL, voice=voice, input=spoken)
             with open("output.wav", "wb") as f:
                 f.write(resp.content)
@@ -332,14 +329,14 @@ def looks_like_weather(q: str) -> bool:
 
 # ====== Timer logic ======
 def start_timer(seconds, auto_dismiss=True):
-    """Starts a timer and plays a sound when done."""
+    """Starts a timer and shows the top-right bubble with time remaining."""
 
     def start_on_main():
         win._timer_seconds_left = seconds
         win._update_timer_label()
         win.timerLabel.raise_()
         win._timer_qtimer.start(1000)
-    QTimer.singleShot(0, start_on_main)
+    QTimer.singleShot(0, win, start_on_main)
 
     def timer_thread():
         threading.Event().wait(seconds)
@@ -358,12 +355,12 @@ def start_timer(seconds, auto_dismiss=True):
             print(f"[Timer sound error] {e}")
 
         if auto_dismiss:
-            # UI updates via signals + singleShot for label/qtimer
-            self_ref = win  # (alias)
+            self_ref = win
             self_ref.statusSig.emit("Idle")
             self_ref.wakeModeSig.emit('off')
-            QTimer.singleShot(0, lambda: (self_ref.timerLabel.setText(""),
-                                        self_ref._timer_qtimer.stop()))
+            QTimer.singleShot(0, self_ref, lambda: (self_ref.timerLabel.setText(""),
+                                          self_ref.timerLabel.hide(),
+                                          self_ref._timer_qtimer.stop()))
 
     threading.Thread(target=timer_thread, daemon=True).start()
 
@@ -376,7 +373,7 @@ def format_duration_human(seconds):
         parts.append(f"{h} hour" + ("s" if h != 1 else ""))
     if m > 0:
         parts.append(f"{m} minute" + ("s" if m != 1 else ""))
-    if s > 0 or not parts:  # always show seconds if nothing else
+    if s > 0 or not parts:
         parts.append(f"{s} second" + ("s" if s != 1 else ""))
     return ", ".join(parts)
 
@@ -394,8 +391,8 @@ class WakeBar(QWidget):
         self._active = False
         self._t = 0.0
         self._mode = 'off'
-        self._orange_mix = 0.0  # 0=blue, 1=orange
-        self._fade = 0.0        # 0=opaque, 1=transparent
+        self._orange_mix = 0.0
+        self._fade = 0.0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer_seconds_left = 0
@@ -412,15 +409,14 @@ class WakeBar(QWidget):
 
         if mode == 'listen':
             self._mode = 'listen'
-            self._orange_mix = 0.0      # solid blue
+            self._orange_mix = 0.0
             self._fade = 0.0
         elif mode == 'think':
             self._mode = 'think'
-            self._orange_mix = 0.0      # start at blue, cross-fade to orange in _tick
+            self._orange_mix = 0.0
             self._fade = 0.0
         elif mode == 'speaking':
             self._mode = 'speaking'
-            # keep orange; only reset fade so it fades out
             self._fade = 0.0
 
         self.showActive(True)
@@ -440,14 +436,11 @@ class WakeBar(QWidget):
         self._t += 0.035
 
         if self._mode == 'think':
-            # smooth cross-fade blue -> orange (~0.6–0.8s)
             self._orange_mix = min(1.0, self._orange_mix + 0.05)
             self._fade = 0.0
         elif self._mode == 'speaking':
-            # fade orange to transparent (~0.8s)
             self._fade = min(1.0, self._fade + 0.04)
             if self._fade >= 1.0:
-                # fully transparent → disappear (prevents "freeze")
                 self.setMode('off')
                 return
 
@@ -489,7 +482,6 @@ class WakeBar(QWidget):
         # breathing base alpha
         pulse = 0.6 + 0.4 * math.sin(self._t * 2.0)
         base_alpha = int(150 + 70 * pulse)
-        # apply fade opacity
         base_alpha = int(base_alpha * (1.0 - self._fade))
 
         # Palettes
@@ -509,7 +501,7 @@ class WakeBar(QWidget):
         grad.setColorAt(1.00, self._mixColor(blue_right, orange_right, tcol, base_alpha))
         p.fillPath(path, grad)
 
-        # "comet" highlight mixes cyan -> warm
+        # "comet" highlight
         comet_blue_inner = QColor(200, 255, 255)
         comet_blue_mid   = QColor(0, 220, 255)
         comet_warm_inner = QColor(255, 230, 200)
@@ -524,18 +516,9 @@ class WakeBar(QWidget):
         p.setPen(Qt.NoPen)
         p.drawPath(path)
 
-        # subtle top edge glow
         p.setOpacity(0.9 * (1.0 - self._fade))
         p.strokePath(path, QPen(self._mixColor(QColor(0,230,255,180), QColor(255,190,90,180), tcol, 180), 2))
-
-        if self._timer_seconds_left > 0:
-            p.setPen(Qt.red)
-            p.setFont(QFont("Arial", 32))
-            hrs = self._timer_seconds_left // 3600
-            mins = (self._timer_seconds_left % 3600) // 60
-            secs = self._timer_seconds_left % 60
-            text = f"{hrs:02}:{mins:02}:{secs:02}"
-            p.drawText(self.width() - 150, 40, text)
+        # (Removed drawing raw timer here; bubble handles it.)
 
 # ========= Clock (Echo Show vibe) =========
 class ClockWidget(QLabel):
@@ -555,13 +538,13 @@ class ClockWidget(QLabel):
         f = QFont("Segoe UI", 20, QFont.Medium)
         self.setFont(f)
 
-# ========= Mic Listener Thread (logs to terminal) =========
+# ========= Mic Listener Thread =========
 class MicListener(QThread):
     append = pyqtSignal(str)
     query = pyqtSignal(str)
     exit_signal = pyqtSignal()
-    wake = pyqtSignal()       # emitted when "GPT" is detected
-    status = pyqtSignal(str)  # e.g., "Listening"
+    wake = pyqtSignal()
+    status = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -603,7 +586,7 @@ class MicListener(QThread):
                     return
 
                 if contains_wake(heard):
-                    self.wake.emit()  # show blue bar (listen mode)
+                    self.wake.emit()
                     remainder = split_after_wake(heard)
                     if remainder:
                         self.query.emit(remainder)
@@ -637,7 +620,7 @@ class MicListener(QThread):
                 print(f"Mic error: {e}", flush=True)
                 continue
 
-# ========= Main Window (Alexa screen styling) =========
+# ========= Main Window =========
 class AskZacWindow(QMainWindow):
     appendSignal = pyqtSignal(str)
     statusSig = pyqtSignal(str)
@@ -648,10 +631,10 @@ class AskZacWindow(QMainWindow):
             hrs = self._timer_seconds_left // 3600
             mins = (self._timer_seconds_left % 3600) // 60
             secs = self._timer_seconds_left % 60
-            self.timerLabel.setText(f"{hrs:02}:{mins:02}:{secs:02}")
+            self.timerLabel.setText(f"⏱ {hrs:02}:{mins:02}:{secs:02}")
             self.timerLabel.adjustSize()
             cw = self.centralWidget()
-            self.timerLabel.move(cw.width() - self.timerLabel.width() - 20, 10)
+            self.timerLabel.move(cw.width() - self.timerLabel.width() - 20, 14)
             self.timerLabel.show()
             self.timerLabel.raise_()
             self._timer_seconds_left -= 1
@@ -662,17 +645,20 @@ class AskZacWindow(QMainWindow):
 
     def resizeEvent(self, event):
         cw = self.centralWidget()
-        self.timerLabel.move(cw.width() - self.timerLabel.width() - 20, 10)
+        self.timerLabel.move(cw.width() - self.timerLabel.width() - 20, 14)
         super(AskZacWindow, self).resizeEvent(event)
+        self.timerLabel.raise_()
 
     def __init__(self):
         super().__init__()
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setWindowTitle("AskZac")
-        # Alexa-like deep blue gradient background
+        # Alexa-like deep blue gradient background + timer bubble style
         self.setStyleSheet("""
-            QMainWindow { background: qlineargradient(x1:0,y1:0, x2:0,y2:1,
-                                stop:0 #0a1026, stop:0.6 #0d1a3a, stop:1 #0b1631); }
+            QMainWindow {
+                background: qlineargradient(x1:0,y1:0, x2:0,y2:1,
+                                stop:0 #0a1026, stop:0.6 #0d1a3a, stop:1 #0b1631);
+            }
             QLabel#title {
                 color: #e8f2ff; font-size: 44px; font-weight: 700; letter-spacing: 0.6px;
             }
@@ -687,6 +673,16 @@ class AskZacWindow(QMainWindow):
                 font-family: Segoe UI, Roboto, "Fira Sans", Arial;
                 font-size: 28px;
             }
+            QLabel#timerBubble {
+                color: #ffffff;
+                background: rgba(40,45,60,220);        /* slightly lighter gray bubble */
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 14px;
+                padding: 6px 12px;
+                font-size: 18px;
+                font-weight: 600;
+                letter-spacing: 0.5px;
+            }
         """)
 
         central = QWidget(self)
@@ -698,13 +694,20 @@ class AskZacWindow(QMainWindow):
         self.clock = ClockWidget(self)
         root.addWidget(self.clock, 0, Qt.AlignHCenter)
 
-        # Timer label (top-right)
+        # Timer bubble (top-right)
         self.timerLabel = QLabel("", central)
+        self.timerLabel.setObjectName("timerBubble")
         self.timerLabel.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.timerLabel.hide()
-        self.timerLabel.setStyleSheet("color:#ffcc66; font-size: 20px; font-weight: 500;")
-        self.timerLabel.setFixedHeight(28)  # optional
-        self.timerLabel.move(self.width() - 120, 10)  # initial position near top right
+        # Monospace-ish digits for stable width (fallbacks ok)
+        self.timerLabel.setFont(QFont("Consolas", 18, QFont.DemiBold))
+        # Subtle shadow for pop
+        shadow = QGraphicsDropShadowEffect(self.timerLabel)
+        shadow.setBlurRadius(24)
+        shadow.setOffset(0, 2)
+        shadow.setColor(QColor(0, 0, 0, 180))
+        self.timerLabel.setGraphicsEffect(shadow)
+        self.timerLabel.move(self.width() - 160, 14)
         self.timerLabel.raise_()
 
         self._timer_seconds_left = 0
@@ -719,7 +722,9 @@ class AskZacWindow(QMainWindow):
         self.textArea.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.textArea.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.textArea.setAlignment(Qt.AlignHCenter)
+        self.timerLabel.setFont(QFont("Segoe UI", 18, QFont.DemiBold))
         root.addWidget(self.textArea, 1)
+        self.timerLabel.setTextFormat(Qt.PlainText)
 
         self.wakeBar = WakeBar(self, height=18)
         root.addWidget(self.wakeBar)
@@ -765,7 +770,6 @@ class AskZacWindow(QMainWindow):
         self.appendSignal.emit(msg)
 
     def _append(self, msg: str):
-        # Replace previous content so the screen doesn't get clogged
         self.textArea.clear()
         self.textArea.setText(msg)
         self.textArea.moveCursor(self.textArea.textCursor().End)
@@ -779,20 +783,17 @@ class AskZacWindow(QMainWindow):
     def onWake(self):
         self.wakeBar.setMode('listen')
 
-    # ----- Core logic (ALWAYS phrased via GPT) -----
+    # ----- Core logic -----
     def ask_and_speak(self, query: str):
         print(f"You: {query}", flush=True)
         print("Thinking...", flush=True)
 
-        # pause ASAP so MicListener doesn't overwrite "Thinking"
         self.pause_listening()
         self.set_status("Thinking")
         self.textArea.clear()
 
-        # thinking -> fade to orange
         self.wakeBar.setMode('think')
 
-        # watchdog: if still "think" after 30s, reset UI and resume
         QTimer.singleShot(30000, lambda: (
             self.wakeBar.setMode('off'),
             self.set_status('Listening'),
@@ -812,14 +813,13 @@ class AskZacWindow(QMainWindow):
                 text_to_speak = f"Timer set for {human_time}."
                 self.append(text_to_speak)
                 speak_openai(text_to_speak, on_done=lambda: self._resume_after_tts())
-                QTimer.singleShot(0, lambda: self.wakeBar.setMode('off'))
-                QTimer.singleShot(0, lambda: self.set_status("Idle"))
+                QTimer.singleShot(0, self, lambda: self.wakeBar.setMode('off'))
+                QTimer.singleShot(0, self, lambda: self.set_status("Idle"))
                 start_timer(secs, auto_dismiss=True)
                 return
 
             answer = ask_openai(query)
 
-            # Weather-smart path (always phrased)
             if answer == UNCERTAIN_TOKEN and looks_like_weather(query):
                 try:
                     w = fetch_weather_zip(USER_ZIP, tz=TZ)
@@ -841,7 +841,6 @@ class AskZacWindow(QMainWindow):
                 except Exception as e:
                     print(f"Weather fetch failed: {e}. Checking the web…", flush=True)
 
-            # Web search synth (never raw)
             if answer == UNCERTAIN_TOKEN:
                 print("Checking the web…", flush=True)
                 results = web_search_structured(query, n=SEARCH_RESULTS_N)
@@ -859,14 +858,13 @@ class AskZacWindow(QMainWindow):
                     speak_and_fade(synth)
                 return
 
-            # Normal path
             self.append(f"AskZac: {answer}")
             speak_and_fade(answer)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def pause_listening(self):
-        self.listening_enabled = False
+        self.listening_enabled = True and False  # keep semantics explicit
         self.listener.listening_enabled = False
 
     def resume_listening(self):
@@ -874,10 +872,9 @@ class AskZacWindow(QMainWindow):
         self.listener.listening_enabled = True
 
     def _resume_after_tts(self):
-        # resume flags on main thread
         QTimer.singleShot(0, self.resume_listening)
-        self.statusSig.emit("Listening")    # UI back to Listening
-        self.wakeModeSig.emit('off')        # hide bar
+        self.statusSig.emit("Listening")
+        self.wakeModeSig.emit('off')
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape and self.isFullScreen():
