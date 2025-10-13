@@ -331,12 +331,7 @@ def looks_like_weather(q: str) -> bool:
 def start_timer(seconds, auto_dismiss=True):
     """Starts a timer and shows the top-right bubble with time remaining."""
 
-    def start_on_main():
-        win._timer_seconds_left = seconds
-        win._update_timer_label()
-        win.timerLabel.raise_()
-        win._timer_qtimer.start(1000)
-    QTimer.singleShot(0, win, start_on_main)
+    win.startTimerSig.emit(seconds)
 
     def timer_thread():
         threading.Event().wait(seconds)
@@ -358,9 +353,7 @@ def start_timer(seconds, auto_dismiss=True):
             self_ref = win
             self_ref.statusSig.emit("Idle")
             self_ref.wakeModeSig.emit('off')
-            QTimer.singleShot(0, self_ref, lambda: (self_ref.timerLabel.setText(""),
-                                          self_ref.timerLabel.hide(),
-                                          self_ref._timer_qtimer.stop()))
+            self_ref.stopTimerSig.emit()
 
     threading.Thread(target=timer_thread, daemon=True).start()
 
@@ -625,6 +618,8 @@ class AskZacWindow(QMainWindow):
     appendSignal = pyqtSignal(str)
     statusSig = pyqtSignal(str)
     wakeModeSig = pyqtSignal(str)
+    startTimerSig = pyqtSignal(int)
+    stopTimerSig  = pyqtSignal()
 
     def _update_timer_label(self):
         if self._timer_seconds_left > 0:
@@ -648,6 +643,17 @@ class AskZacWindow(QMainWindow):
         self.timerLabel.move(cw.width() - self.timerLabel.width() - 20, 14)
         super(AskZacWindow, self).resizeEvent(event)
         self.timerLabel.raise_()
+
+    def _start_timer_ui(self, seconds: int):
+        self._timer_seconds_left = seconds
+        self._update_timer_label()
+        self.timerLabel.raise_()
+        self._timer_qtimer.start(1000)
+
+    def _stop_timer_ui(self):
+        self.timerLabel.setText("")
+        self.timerLabel.hide()
+        self._timer_qtimer.stop()
 
     def __init__(self):
         super().__init__()
@@ -713,6 +719,8 @@ class AskZacWindow(QMainWindow):
         self._timer_seconds_left = 0
         self._timer_qtimer = QTimer(self)
         self._timer_qtimer.timeout.connect(self._update_timer_label)
+        self.startTimerSig.connect(self._start_timer_ui)
+        self.stopTimerSig.connect(self._stop_timer_ui)
 
         self.statusLabel = QLabel("Idle", self); self.statusLabel.setObjectName("status")
         root.addWidget(self.statusLabel, 0, Qt.AlignLeft)
@@ -813,8 +821,8 @@ class AskZacWindow(QMainWindow):
                 text_to_speak = f"Timer set for {human_time}."
                 self.append(text_to_speak)
                 speak_openai(text_to_speak, on_done=lambda: self._resume_after_tts())
-                QTimer.singleShot(0, self, lambda: self.wakeBar.setMode('off'))
-                QTimer.singleShot(0, self, lambda: self.set_status("Idle"))
+                self.wakeModeSig.emit('off')
+                self.statusSig.emit("Idle")
                 start_timer(secs, auto_dismiss=True)
                 return
 
