@@ -34,11 +34,129 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 USER_ZIP = os.getenv("USER_ZIP", "90210").split('#')[0].strip()
-TIMER_RING_SOUND = os.getenv("TIMER_RING_SOUND", "timer_done.wav").split('#')[0].strip()
+TIMER_RING_SOUND = os.getenv("TIMER_RING_SOUND", "Sounds/alarm-1.mp3").split('#')[0].strip() # Change alarm-1 to alarm-2 for a special suprise.
 SECOND_MONITOR_INDEX = int(os.getenv("MONITOR_NUMBER", "0").split('#')[0].strip())
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5").split('#')[0].strip()
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1").split('#')[0].strip()
 openai.api_key = OPENAI_API_KEY
+
+# ====== Local music playback config ======
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MUSIC_DIR = os.getenv("MUSIC_DIR", "Music").split('#')[0].strip()
+MUSIC_EXTS = {".mp3", ".wav"}
+
+
+def normalize_song_key(text: str) -> str:
+    """Lowercase, strip punctuation, compress spaces; used for fuzzy match keys."""
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def iter_music_files():
+    """
+    Yield (display_name, full_path) for every audio file in Music/.
+    Display name is filename without extension, for TTS like 'Billy Joel - Piano Man'.
+    """
+    root_dir = os.path.join(BASE_DIR, MUSIC_DIR)
+    try:
+        for root, dirs, files in os.walk(root_dir):
+            for name in files:
+                _, ext = os.path.splitext(name)
+                if ext.lower() in MUSIC_EXTS:
+                    full = os.path.join(root, name)
+                    base = os.path.splitext(name)[0]
+                    yield base, full
+    except Exception as e:
+        print(f"[Music] Error scanning {root_dir}: {e}", flush=True)
+
+
+def find_best_music_match(query_text: str):
+    """
+    Fuzzy-match the user query against 'Artist - Title' style names in Music/.
+    Returns (display_name, full_path) or None.
+    """
+    search = normalize_song_key(query_text)
+    if not search:
+        return None
+
+    best = None
+    best_score = 0.0
+    q_tokens = set(search.split())
+
+    for base, full in iter_music_files():
+        key = normalize_song_key(base)
+        if not key:
+            continue
+
+        score = difflib.SequenceMatcher(None, search, key).ratio()
+
+        # Small bonus if every query word appears in the filename key
+        if q_tokens and q_tokens.issubset(set(key.split())):
+            score += 0.15
+
+        if score > best_score:
+            best_score = score
+            best = (base, full)
+
+    # Threshold is intentionally loose so 'play Billy Joel'
+    # still hits 'Billy Joel - Piano Man'.
+    if best and best_score >= 0.45:
+        return best
+    return None
+
+
+def extract_music_query(full_query: str):
+    """
+    If the query looks like a 'play' command, return the song/artist portion.
+    Otherwise return None.
+    Examples:
+      'play billy joel piano man'
+      'play the song piano man by billy joel'
+      'can you play billy joel'
+    """
+    s = full_query.strip()
+    low = s.lower()
+
+    prefixes = [
+        "play ",
+        "play the song ",
+        "play song ",
+        "play the track ",
+        "can you play ",
+        "please play ",
+    ]
+
+    tail = None
+    for p in prefixes:
+        if low.startswith(p):
+            tail = s[len(p):].strip()
+            break
+
+    if tail is None:
+        return None
+
+    # Strip services etc: "on Spotify", "on YouTube", "for me", etc.
+    tail = re.sub(r"\b(on|in)\s+(spotify|youtube|apple music|amazon music)\b", "", tail, flags=re.I)
+    tail = re.sub(r"\bfor me\b", "", tail, flags=re.I)
+
+    tail = tail.strip(" ,.")
+    return tail or None
+
+
+def play_music_file(path: str):
+    """Spawn ffplay in a background thread to play a local track."""
+    def _runner():
+        try:
+            subprocess.run(
+                ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        except Exception as e:
+            print(f"[Music playback error] {e}", flush=True)
+
+    threading.Thread(target=_runner, daemon=True).start()
 
 # ====== Speech Recog ======
 recognizer = sr.Recognizer()
@@ -755,6 +873,37 @@ class AskZacWindow(QMainWindow):
         quick_calibrate(0.6)
         self.listener.start()
 
+    def _maybe_handle_music_command(self, query: str) -> bool:
+        """
+        If query starts with 'play ...', try to resolve it to a local file in Music/.
+        On success: speak 'Playing ...' and start ffplay, then return True.
+        On failure: speak an error and return True.
+        If it's not a play command at all, return False.
+        """
+        music_query = extract_music_query(query)
+        if not music_query:
+            return False
+
+        match = find_best_music_match(music_query)
+        if not match:
+            msg = "I could not find that song in your Music folder."
+            self.append(msg)
+            self.wakeModeSig.emit('speaking')
+            self.statusSig.emit("Speaking")
+            speak_openai(msg, on_done=self._resume_after_tts)
+            return True
+
+        display_name, full_path = match
+        msg = f"Playing {display_name}."
+        self.append(msg)
+        self.wakeModeSig.emit('speaking')
+        self.statusSig.emit("Speaking")
+        speak_openai(msg, on_done=self._resume_after_tts)
+
+        # Kick off playback (non-blocking)
+        play_music_file(full_path)
+        return True
+
     # ----- Placement on second monitor -----
     def place_on_second_monitor(self, index=SECOND_MONITOR_INDEX, fullscreen=FULLSCREEN_ON_SECOND):
         app = QApplication.instance()
@@ -814,6 +963,10 @@ class AskZacWindow(QMainWindow):
             speak_openai(text_to_say, on_done=self._resume_after_tts)
 
         def worker():
+            # 1) Local music playback intent: 'play ...'
+            if self._maybe_handle_music_command(query):
+                # Music handled, nothing else to do
+                return
             parsed = ask_openai_with_timer_detection(query)
             if "_timer_seconds" in parsed:
                 secs = parsed["_timer_seconds"]
