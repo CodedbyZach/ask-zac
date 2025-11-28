@@ -1,11 +1,4 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-# Alexa-style full-screen UI on monitor #2, wake bar shows state:
-# Blue while user is speaking, fades into orange while thinking,
-# and smoothly fades to transparent while speaking.
-
-import os, sys, re, difflib, threading, subprocess, json, math, requests, openai, tempfile, urllib.request
+import os, sys, re, difflib, threading, subprocess, json, math, requests, openai, tempfile, urllib.request, time
 import speech_recognition as sr
 from dotenv import load_dotenv
 from requests.exceptions import ChunkedEncodingError, ConnectionError
@@ -13,7 +6,7 @@ from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QTime, QDate
 from PyQt5.QtGui import QPainter, QLinearGradient, QColor, QFont, QPainterPath, QRadialGradient, QPen
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel,
-    QTextEdit, QGraphicsDropShadowEffect  # ← added
+    QTextEdit, QGraphicsDropShadowEffect
 )
 
 # ================== Config ==================
@@ -27,9 +20,6 @@ UNCERTAIN_TOKEN  = "<i-dont-know>"
 TZ               = "America/New_York"
 SEARCH_RESULTS_N = 3
 FULLSCREEN_ON_SECOND = True
-# ===========================================
-
-# ====== Env / API ======
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
@@ -39,11 +29,175 @@ SECOND_MONITOR_INDEX = int(os.getenv("MONITOR_NUMBER", "0").split('#')[0].strip(
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5").split('#')[0].strip()
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1").split('#')[0].strip()
 openai.api_key = OPENAI_API_KEY
-
-# ====== Local music playback config ======
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MUSIC_DIR = os.getenv("MUSIC_DIR", "Music").split('#')[0].strip()
 MUSIC_EXTS = {".mp3", ".wav"}
+
+
+# ====== Cross-platform volume dimmer (Windows + Linux) ======
+_VOLUME_AVAILABLE = False
+_VOLUME_MODE = None  # "windows" or "linux"
+_baseline_volume = None  # scalar 0.0–1.0
+_volume_lock = threading.Lock()
+
+try:
+    if sys.platform.startswith("win"):
+        from ctypes import POINTER, cast
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        _VOLUME_AVAILABLE = True
+        _VOLUME_MODE = "windows"
+        print("[Volume] pycaw available, Windows dimming ENABLED", flush=True)
+
+    elif sys.platform.startswith("linux"):
+        from shutil import which
+        if which("pactl") is not None:
+            _VOLUME_AVAILABLE = True
+            _VOLUME_MODE = "linux"
+            print("[Volume] pactl available, Linux dimming ENABLED", flush=True)
+        else:
+            print("[Volume] pactl not found, Linux dimming DISABLED", flush=True)
+
+    else:
+        print(f"[Volume] Unsupported platform {sys.platform}, dimming DISABLED", flush=True)
+
+except Exception as e:
+    print(f"[Volume] init error: {e}", flush=True)
+    _VOLUME_AVAILABLE = False
+    _VOLUME_MODE = None
+
+
+def _get_current_volume_scalar():
+    """
+    Returns current master volume as a scalar 0.0–1.0 for the active platform.
+    """
+    if not _VOLUME_AVAILABLE:
+        raise RuntimeError("Volume not available")
+
+    if _VOLUME_MODE == "windows":
+        # pycaw: AudioEndpointVolume scalar
+        devices = AudioUtilities.GetSpeakers()
+        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        volume = cast(interface, POINTER(IAudioEndpointVolume))
+        return float(volume.GetMasterVolumeLevelScalar())
+
+    if _VOLUME_MODE == "linux":
+        # pactl: parse "%"" from default sink
+        out = subprocess.check_output(
+            ["pactl", "get-sink-volume", "@DEFAULT_SINK@"],
+            stderr=subprocess.DEVNULL
+        ).decode("utf-8", errors="ignore")
+
+        # Example line:
+        # "Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB"
+        m = re.search(r"/\s*(\d+)%", out)
+        if not m:
+            raise RuntimeError(f"Cannot parse pactl output: {out!r}")
+        pct = int(m.group(1))
+        return max(0.0, min(1.0, pct / 100.0))
+
+    raise RuntimeError("Unknown volume mode")
+
+
+def _set_volume_scalar(scalar: float):
+    """
+    Set master volume to scalar 0.0–1.0 for the active platform.
+    """
+    scalar = max(0.0, min(1.0, float(scalar)))
+    if not _VOLUME_AVAILABLE:
+        return
+
+    if _VOLUME_MODE == "windows":
+        try:
+            devices = AudioUtilities.GetSpeakers()
+            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            volume = cast(interface, POINTER(IAudioEndpointVolume))
+            volume.SetMasterVolumeLevelScalar(scalar, None)
+        except Exception as e:
+            print(f"[Volume] Windows set failed: {e}", flush=True)
+        return
+
+    if _VOLUME_MODE == "linux":
+        try:
+            pct = max(0, min(100, int(round(scalar * 100))))
+            subprocess.run(
+                ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{pct}%"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        except Exception as e:
+            print(f"[Volume] Linux set failed: {e}", flush=True)
+        return
+
+
+def _fade_to(target: float, duration: float = 0.4, steps: int = 10):
+    """
+    Smoothly fade master volume to 'target' in [0.0, 1.0] over duration,
+    remembering a baseline so we can restore after ducking.
+    """
+    global _baseline_volume
+    if not _VOLUME_AVAILABLE:
+        print("[Volume] _fade_to called but dimming unavailable", flush=True)
+        return
+
+    target = max(0.0, min(1.0, float(target)))
+
+    with _volume_lock:
+        try:
+            start = _get_current_volume_scalar()
+            print(f"[Volume] current={start:.3f} target={target:.3f}", flush=True)
+        except Exception as e:
+            print(f"[Volume] read failed: {e}", flush=True)
+            return
+
+        # Store original volume once, when we first dim downward
+        if _baseline_volume is None and target < start:
+            _baseline_volume = start
+            print(f"[Volume] baseline set to {start:.3f}", flush=True)
+
+        if steps <= 0 or duration <= 0:
+            _set_volume_scalar(target)
+            return
+
+        delta = target - start
+        for i in range(steps):
+            v = start + delta * (i + 1) / steps
+            _set_volume_scalar(v)
+            time.sleep(duration / steps)
+
+
+def dim_system_volume():
+    """
+    Called on wake-word: duck everything by lowering master volume.
+    """
+    if not _VOLUME_AVAILABLE:
+        print("[Volume] dim_system_volume called but dimming unavailable", flush=True)
+        return
+
+    print("[Volume] dim_system_volume → fading to 0.25", flush=True)
+    threading.Thread(
+        target=lambda: _fade_to(0.25, duration=0.25, steps=8),
+        daemon=True
+    ).start()
+
+
+def restore_system_volume():
+    """
+    Called after TTS finishes: restore master volume back to the
+    previous baseline captured before the last dim.
+    """
+    global _baseline_volume
+    if not _VOLUME_AVAILABLE or _baseline_volume is None:
+        print("[Volume] restore_system_volume skipped (no baseline)", flush=True)
+        return
+
+    prev = _baseline_volume
+    _baseline_volume = None
+    print(f"[Volume] restore_system_volume → fading back to {prev:.3f}", flush=True)
+    threading.Thread(
+        target=lambda: _fade_to(prev, duration=0.25, steps=8),
+        daemon=True
+    ).start()
 
 
 def normalize_song_key(text: str) -> str:
@@ -143,20 +297,61 @@ def extract_music_query(full_query: str):
     tail = tail.strip(" ,.")
     return tail or None
 
+# Track music playback so we can stop / resume
+_current_music_proc = None
+_current_music_path = None
+_music_lock = threading.Lock()
 
 def play_music_file(path: str):
-    """Spawn ffplay in a background thread to play a local track."""
-    def _runner():
+    """Spawn ffplay in a background thread to play a local track and remember it."""
+    global _current_music_proc, _current_music_path
+
+    def _runner(proc_obj):
+        global _current_music_proc
         try:
-            subprocess.run(
+            proc_obj.wait()
+        finally:
+            with _music_lock:
+                if _current_music_proc is proc_obj:
+                    _current_music_proc = None
+
+    try:
+        with _music_lock:
+            _current_music_path = path
+            _current_music_proc = subprocess.Popen(
                 ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', path],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
-        except Exception as e:
-            print(f"[Music playback error] {e}", flush=True)
+            t = threading.Thread(target=_runner, args=(_current_music_proc,), daemon=True)
+            t.start()
+    except Exception as e:
+        print(f"[Music playback error] {e}", flush=True)
 
-    threading.Thread(target=_runner, daemon=True).start()
+
+def stop_music():
+    """Stop the currently playing song (if any)."""
+    global _current_music_proc
+    with _music_lock:
+        proc = _current_music_proc
+        _current_music_proc = None
+    if proc is not None:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+
+
+def resume_music():
+    """
+    Restart the last song from the beginning.
+    (ffplay cannot resume from the middle without a proper player API.)
+    """
+    with _music_lock:
+        path = _current_music_path
+    if path:
+        play_music_file(path)
 
 # ====== Speech Recog ======
 recognizer = sr.Recognizer()
@@ -720,11 +915,13 @@ class MicListener(QThread):
                                 if q:
                                     self.query.emit(q)
                             except sr.UnknownValueError:
-                                print("Didn't catch that—try again with 'GPT, …'", flush=True)
+                                print("Didn't catch that, try again with 'GPT, …'", flush=True)
+                                restore_system_volume()
                             except sr.RequestError as e:
                                 print(f"ASR error: {e}", flush=True)
                         except sr.WaitTimeoutError:
-                            print("Timed out—say 'GPT, …' again.", flush=True)
+                            print("Timed out. Say 'GPT, …' again.", flush=True)
+                            restore_system_volume()
             except sr.WaitTimeoutError:
                 continue
             except Exception as e:
@@ -876,9 +1073,8 @@ class AskZacWindow(QMainWindow):
     def _maybe_handle_music_command(self, query: str) -> bool:
         """
         If query starts with 'play ...', try to resolve it to a local file in Music/.
-        On success: speak 'Playing ...' and start ffplay, then return True.
-        On failure: speak an error and return True.
-        If it's not a play command at all, return False.
+        On success: say 'Playing ...', then AFTER TTS finishes start the song.
+        On failure: say an error. If it's not a play command at all, return False.
         """
         music_query = extract_music_query(query)
         if not music_query:
@@ -898,10 +1094,14 @@ class AskZacWindow(QMainWindow):
         self.append(msg)
         self.wakeModeSig.emit('speaking')
         self.statusSig.emit("Speaking")
-        speak_openai(msg, on_done=self._resume_after_tts)
 
-        # Kick off playback (non-blocking)
-        play_music_file(full_path)
+        def after_tts():
+            # Normal volume restore + resume listening
+            self._resume_after_tts()
+            # Now start the music at full volume
+            play_music_file(full_path)
+
+        speak_openai(msg, on_done=after_tts)
         return True
 
     # ----- Placement on second monitor -----
@@ -938,12 +1138,39 @@ class AskZacWindow(QMainWindow):
 
     # ----- Wake bar control -----
     def onWake(self):
+        # Dim system volume while we're in wake / listen mode
+        dim_system_volume()
         self.wakeBar.setMode('listen')
 
     # ----- Core logic -----
     def ask_and_speak(self, query: str):
         print(f"You: {query}", flush=True)
         print("Thinking...", flush=True)
+
+        # ====== Stop / Resume music by voice ======
+        qlow = query.strip().lower()
+
+        if qlow in {"stop", "stop music", "stop the music", "stop song", "stop the song"}:
+            stop_music()
+            self.append("Stopping music.")
+            self.wakeModeSig.emit('speaking')
+            self.statusSig.emit("Speaking")
+            speak_openai("Stopping music.", on_done=self._resume_after_tts)
+            return
+
+        if qlow in {"resume", "resume music", "continue music", "continue the music"}:
+            if _current_music_path:
+                resume_music()
+                self.append("Resuming music.")
+                self.wakeModeSig.emit('speaking')
+                self.statusSig.emit("Speaking")
+                speak_openai("Resuming music.", on_done=self._resume_after_tts)
+            else:
+                self.append("There is no music to resume.")
+                self.wakeModeSig.emit('speaking')
+                self.statusSig.emit("Speaking")
+                speak_openai("There is no music to resume.", on_done=self._resume_after_tts)
+            return
 
         self.pause_listening()
         self.set_status("Thinking")
@@ -1033,6 +1260,8 @@ class AskZacWindow(QMainWindow):
         self.listener.listening_enabled = True
 
     def _resume_after_tts(self):
+        # Bring volume back up to whatever it was before dimming
+        restore_system_volume()
         QTimer.singleShot(0, self.resume_listening)
         self.statusSig.emit("Listening")
         self.wakeModeSig.emit('off')
