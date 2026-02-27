@@ -1,10 +1,10 @@
-import os, sys, re, difflib, threading, subprocess, json, math, requests, openai, tempfile, urllib.request, time
-import speech_recognition as sr
-from dotenv import load_dotenv
-from requests.exceptions import ChunkedEncodingError, ConnectionError
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QTime, QDate
-from PyQt5.QtGui import QPainter, QLinearGradient, QColor, QFont, QPainterPath, QRadialGradient, QPen
-from PyQt5.QtWidgets import (
+import os, sys, re, difflib, threading, subprocess, json, math, requests, openai, tempfile, urllib.request, time # type: ignore
+import speech_recognition as sr # type: ignore
+from dotenv import load_dotenv # type: ignore
+from requests.exceptions import ChunkedEncodingError, ConnectionError # type: ignore
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QTime, QDate # type: ignore
+from PyQt5.QtGui import QPainter, QLinearGradient, QColor, QFont, QPainterPath, QRadialGradient, QPen # type: ignore
+from PyQt5.QtWidgets import ( # type: ignore
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel,
     QTextEdit, QGraphicsDropShadowEffect
 )
@@ -17,7 +17,6 @@ WAKE_PHRASE_MAXS = 5.0
 QUESTION_TIMEOUT = 10.0
 QUESTION_MAXS    = 14.0
 UNCERTAIN_TOKEN  = "<i-dont-know>"
-TZ               = "America/New_York"
 SEARCH_RESULTS_N = 3
 FULLSCREEN_ON_SECOND = True
 load_dotenv()
@@ -28,6 +27,7 @@ TIMER_RING_SOUND = os.getenv("TIMER_RING_SOUND", "Sounds/alarm-1.mp3").split('#'
 SECOND_MONITOR_INDEX = int(os.getenv("MONITOR_NUMBER", "0").split('#')[0].strip())
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5").split('#')[0].strip()
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1").split('#')[0].strip()
+TZ        = os.getenv("TZ", "America/New_York").split('#')[0].strip()
 openai.api_key = OPENAI_API_KEY
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MUSIC_DIR = os.getenv("MUSIC_DIR", "Music").split('#')[0].strip()
@@ -43,8 +43,8 @@ _volume_lock = threading.Lock()
 try:
     if sys.platform.startswith("win"):
         from ctypes import POINTER, cast
-        from comtypes import CLSCTX_ALL
-        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        from comtypes import CLSCTX_ALL # type: ignore
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume # type: ignore
         _VOLUME_AVAILABLE = True
         _VOLUME_MODE = "windows"
         print("[Volume] pycaw available, Windows dimming ENABLED", flush=True)

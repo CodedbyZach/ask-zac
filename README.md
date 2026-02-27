@@ -1,6 +1,6 @@
 # AskZac
 
-## **Version:** 26.2.0
+## **Version:** 26.2.1
 ## Prerequisites
 - Python 3.10+ (`python --version` or `python3 --version`)
 - Git
@@ -62,3 +62,5 @@ chmod -x run.sh
 ```bash
 deactivate
 ```
+
+**Note: Timezone variable in the .env is only used for the weather to be more accurate. Currently, it uses your OS time zone for the time and date displayed on the screen.**
