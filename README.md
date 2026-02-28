@@ -1,6 +1,6 @@
 # AskZac
 
-## **Version:** 26.2.1
+## **Version:** 26.02.0
 ## Prerequisites
 - Python 3.10+ (`python --version` or `python3 --version`)
 - Git
