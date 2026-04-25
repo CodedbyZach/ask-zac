@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import ( # type: ignore
 
 # ================== Config ==================
 WAKE_CANONICAL = "gpt"
-WAKE_CANONICAL_SPOKEN = "gee pee tee"
+WAKE_CANONICAL_SPOKEN = "PPT"
 WAKE_TIMEOUT_S   = 6.0
 WAKE_PHRASE_MAXS = 5.0
 QUESTION_TIMEOUT = 10.0
