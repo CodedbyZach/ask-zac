@@ -1,8 +1,9 @@
 # AskZac
 
-## **Version:** 26.04.1
+## **Version:** 26.04.2
 ## Prerequisites
-- Python 3.10+ (`python --version` or `python3 --version`)
+- Python 3.10+ (preferrably 3.12) (`python --version` or `python3 --version`)
+- Pip (UV Prefferrably)
 - Git
 
 ## 1) Get the code
