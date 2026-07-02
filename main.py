@@ -1,10 +1,10 @@
-import os, sys, re, threading, subprocess, json, math, requests, time
+import os, sys, re, threading, subprocess, json, math, requests, time, io
 from google import genai
 from google.genai import types
 import speech_recognition as sr
 from gtts import gTTS
 from dotenv import load_dotenv
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QTime
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QTime, QObject
 from PyQt5.QtGui import QPainter, QLinearGradient, QColor, QPainterPath
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QTextEdit
 
@@ -12,21 +12,51 @@ load_dotenv()
 WAKE_CANONICAL = "gpt"
 WAKE_TIMEOUT_S = 6.0
 QUESTION_TIMEOUT = 8.0
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+TTS_TEMPO = 1.15
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 USER_ZIP = os.getenv("USER_ZIP", "90210")
 MUSIC_DIR = os.getenv("MUSIC_DIR", "Music")
 MUSIC_EXTS = {".mp3", ".wav"}
+MONITOR_NUMBER = int(os.getenv("MONITOR_NUMBER", "0"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def _set_vol(val):
-    if sys.platform == "linux":
-        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{int(val*100)}%"], capture_output=True)
+class ExitSignal(QObject):
+    exit_sig = pyqtSignal()
 
-def dim_system_volume(): threading.Thread(target=lambda: _set_vol(0.25), daemon=True).start()
-def restore_system_volume(): threading.Thread(target=lambda: _set_vol(1.0), daemon=True).start()
+active_players = []
+active_players_lock = threading.Lock()
+
+def register_player(proc):
+    with active_players_lock:
+        active_players.append(proc)
+
+def unregister_player(proc):
+    with active_players_lock:
+        if proc in active_players:
+            active_players.remove(proc)
+
+def kill_active_players():
+    with active_players_lock:
+        procs = list(active_players)
+    for proc in procs:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+def stdin_exit_listener(exit_signal):
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if line.strip().lower() == "exit":
+            kill_active_players()
+            exit_signal.exit_sig.emit()
+            break
 
 class AIWorker(QThread):
     finished_sig = pyqtSignal(str, bool)
@@ -103,7 +133,6 @@ class AskZacWindow(QMainWindow):
                     r.adjust_for_ambient_noise(s, 0.3)
                     audio = r.listen(s, timeout=WAKE_TIMEOUT_S, phrase_time_limit=3.0)
                 if WAKE_CANONICAL in r.recognize_google(audio).lower():
-                    dim_system_volume()
                     self.update_ui_sig.emit("Listening...", "listen")
                     with m as s:
                         audio2 = r.listen(s, timeout=QUESTION_TIMEOUT, phrase_time_limit=10.0)
@@ -112,7 +141,6 @@ class AskZacWindow(QMainWindow):
             except Exception:
                 if getattr(self.bar, "mode", "off") == "listen":
                     self.update_ui_sig.emit("", "off")
-                    restore_system_volume()
 
     def safe_update_ui(self, text, mode):
         self.area.setText(text); self.bar.setMode(mode)
@@ -126,7 +154,7 @@ class AskZacWindow(QMainWindow):
     def handle_ai_done(self, res, is_music):
         if is_music:
             self.area.setText("Playing music...")
-            self.speak_and_done("Playing music.", lambda: subprocess.Popen(['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', res]))
+            self.speak_and_done("Playing music.", lambda: register_player(subprocess.Popen(['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', res])))
         else:
             self.area.setText(res); self.bar.setMode('speaking')
             self.speak_and_done(res, None)
@@ -134,19 +162,39 @@ class AskZacWindow(QMainWindow):
     def speak_and_done(self, text, callback):
         def run():
             try:
-                audio_file = os.path.join(BASE_DIR, "temp_response.mp3")
                 tts = gTTS(text=text, lang='en', slow=False)
-                tts.save(audio_file)
-                subprocess.run(['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', audio_file])
-                if os.path.exists(audio_file):
-                    os.remove(audio_file)
+                buf = io.BytesIO()
+                tts.write_to_fp(buf)
+                proc = subprocess.Popen(
+                    ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet',
+                     '-af', f'atempo={TTS_TEMPO}', '-f', 'mp3', 'pipe:0'],
+                    stdin=subprocess.PIPE
+                )
+                register_player(proc)
+                proc.communicate(input=buf.getvalue())
+                unregister_player(proc)
             except: pass
             if callback: callback()
-            restore_system_volume()
             self.update_ui_sig.emit("", "off")
         threading.Thread(target=run, daemon=True).start()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    win = AskZacWindow(); win.resize(800, 480); win.show()
+
+    screens = app.screens()
+    screen = screens[MONITOR_NUMBER] if 0 <= MONITOR_NUMBER < len(screens) else screens[0]
+    geometry = screen.geometry()
+
+    win = AskZacWindow()
+    win.resize(800, 480)
+    win.move(geometry.left(), geometry.top())
+    win.show()
+    win.windowHandle().setScreen(screen)
+    win.move(geometry.left(), geometry.top())
+
+    exit_signal = ExitSignal()
+    exit_signal.exit_sig.connect(app.quit)
+    threading.Thread(target=stdin_exit_listener, args=(exit_signal,), daemon=True).start()
+
+    print("Running AskZac.")
     sys.exit(app.exec_())
