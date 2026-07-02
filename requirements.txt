@@ -2,18 +2,6 @@ google-genai
 gTTS
 python-dotenv
 requests
-httpx
 SpeechRecognition
-pyttsx3
 PyAudio
-pydub
 PyQt5
-PyQt5-Qt5
-PyQt5_sip
-pycaw; sys_platform == 'win32'
-comtypes; sys_platform == 'win32'
-psutil
-numpy
-pydantic
-typing-extensions
-tqdm
