@@ -27,6 +27,7 @@ ALARM_SOUND = os.getenv("ALARM_SOUND", "alarm-1.mp3")
 ALARM_PATH = os.path.join(SOUNDS_DIR, ALARM_SOUND)
 SONG_STOPWORDS = {"play", "the", "song", "track", "please", "me", "a", "can", "you", "some"}
 WAKE_VOLUME_DIM_FACTOR = 0.6
+WAKE_VOLUME_DIM_MIN_PERCENT = int(os.getenv("WAKE_VOLUME_DIM_MIN_PERCENT", "20"))
 MUSIC_DUCK_PERCENT = 20
 STOP_PHRASES = {"stop", "stop music", "stop the music", "stop song", "stop the song"}
 API_HEALTH_CHECK_INTERVAL_S = 30
@@ -150,7 +151,7 @@ class AIWorker(QThread):
                 self.finished_sig.emit(f"Song '{mq}' not found in the music folder.", False)
             return
         try:
-            sys_instr = f"You are AskZac. Respond in 1-2 sentences. Use Google Search. The user's location zip code is {USER_ZIP}. If a timer is requested, respond ONLY with JSON: {{\"timer_seconds\": N}}."
+            sys_instr = f"You are AskZac. Do not use MarkDown format as it will not display correctly, nor use quotes unless you want it to read as inches. Do not use any unicode symbols or emoji, plain text only. Shorten your responses a bit. Respond in 1-2 sentences. Use Google Search. The user's location zip code is {USER_ZIP}. If a timer is requested, respond ONLY with JSON: {{\"timer_seconds\": N}}."
             config = types.GenerateContentConfig(
                 system_instruction=sys_instr,
                 tools=[{"google_search": {}}]
@@ -198,7 +199,7 @@ class AskZacWindow(QMainWindow):
 
         top_row = QHBoxLayout()
         self.clock = QLabel(); self.clock.setStyleSheet("color:white; font-size:20px;")
-        self.api_status_label = QLabel("Gemini: …"); self.api_status_label.setStyleSheet("color:#888; font-size:14px;")
+        self.api_status_label = QLabel("Status: …"); self.api_status_label.setStyleSheet("color:#888; font-size:14px;")
         top_row.addStretch(); top_row.addWidget(self.clock); top_row.addStretch(); top_row.addWidget(self.api_status_label)
         l.addLayout(top_row)
 
@@ -427,7 +428,7 @@ class AskZacWindow(QMainWindow):
         if self._cached_volume is not None:
             return
         current = _get_system_volume_percent()
-        if current is None:
+        if current is None or current <= WAKE_VOLUME_DIM_MIN_PERCENT:
             return
         self._cached_volume = current
         _set_system_volume_percent(round(current * WAKE_VOLUME_DIM_FACTOR))
@@ -453,10 +454,10 @@ class AskZacWindow(QMainWindow):
 
     def _set_api_status(self, is_up):
         if is_up:
-            self.api_status_label.setText("● Gemini: Up")
+            self.api_status_label.setText("● Status: Up")
             self.api_status_label.setStyleSheet("color:#2ecc71; font-size:14px;")
         else:
-            self.api_status_label.setText("● Gemini: Down")
+            self.api_status_label.setText("● Status: Down")
             self.api_status_label.setStyleSheet("color:#e74c3c; font-size:14px;")
 
 if __name__ == "__main__":
